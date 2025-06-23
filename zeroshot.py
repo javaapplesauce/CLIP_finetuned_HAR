@@ -7,17 +7,6 @@ import matplotlib.pyplot as plt
 
 def zeroshot():
 
-    ### Load the dataset --> installed datasets and vision dependency
-    ds = load_dataset("Bingsu/Human_Action_Recognition")
-    dataset = ds['train']
-    dataset_test = ds["test"]
-
-
-    ### model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, preprocess = clip.load('ViT-B/32', device)
-    model.to(device)
-
     # Select indices for three example images
     indices = [0, 2, 10]
 
@@ -87,4 +76,15 @@ def zeroshot():
 
 
 if __name__ == '__main__':
+    
+    ### Load the dataset --> installed datasets and vision dependency
+    ds = load_dataset("Bingsu/Human_Action_Recognition")
+    dataset = ds['train']
+    dataset_test = ds["test"]
+    
+    ### model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, preprocess = clip.load('ViT-B/32', device)
+    model.to(device)
+    
     zeroshot() 
