@@ -10,9 +10,11 @@ import torch.nn as nn
 from tqdm import tqdm
 
 
+
+
 def split_dataset(dataset, *, test_size=0.2, seed=None, shuffle=True):
     # Split dataset into training and validation sets
-    split = dataset["train"].train_test_split(
+    split = dataset.train_test_split(
         test_size=test_size,
         shuffle=shuffle,
         seed=seed
