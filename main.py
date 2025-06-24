@@ -4,7 +4,8 @@ import finetune
 import os
 import clip
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig
+from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 import torch.optim as optim
@@ -13,42 +14,41 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 import torch.nn as nn
 
 
-tfms = Compose([Resize(224), ToTensor(),
-                Normalize(mean=(0.481,0.457,0.408),
-                          std=(0.268,0.261,0.275))])      # CLIP defaults
-def collate(batch):
-    sample0 = batch[0]
-    if isinstance(sample0, dict):
-        # old path: each x is a dict with keys "image" and "label"
-        images = torch.stack([tfms(x["image"].convert("RGB")) for x in batch])
-        labels = torch.tensor([x["label"] for x in batch])
-    else:
-        # new path: each x is a tuple, e.g. (PIL.Image, label) or (tensor, label)
-        images = torch.stack([
-            tfms(x[0].convert("RGB")) if not torch.is_tensor(x[0])
-            else x[0]
-            for x in batch
-        ])
-        labels = torch.tensor([x[1] for x in batch])
-    return images, labels
+class HFDataset(Dataset):
+    def __init__(self, hf_dataset, preprocess):
+        self.dataset   = hf_dataset
+        self.preprocess = preprocess
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item  = self.dataset[idx]
+        # HF field is called "labels" in this split :contentReference[oaicite:0]{index=0}
+        label = item["labels"]
+        img   = item["image"].convert("RGB")
+        img_t = self.preprocess(img)
+        return img_t, label
 
 if __name__ == '__main__':
     
     ### Load the dataset --> installed datasets and vision dependency
-    ds = load_dataset("Bingsu/Human_Action_Recognition")
-    dataset = ds['train']
-    dataset_test = ds["test"]
+    dl_config = DownloadConfig(max_retries=10, use_etag=False)
+    ds = load_dataset("Bingsu/Human_Action_Recognition", download_config=dl_config)
+    ds_train, ds_test = finetune.split_dataset(ds)
+
     
     ### model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, preprocess = clip.load('ViT-B/32', device)
     model.to(device)
     
-    ds_train, ds_test = finetune.split_dataset(dataset)
+    train_ds = HFDataset(ds_train, preprocess)
+    test_ds  = HFDataset(ds_test,  preprocess)
 
     # Create DataLoader for training and validation sets
-    train_loader = DataLoader(finetune.HARdataset(ds_train), batch_size=32, shuffle=True, collate_fn=collate) # why is the batch size 32
-    test_loader = DataLoader(finetune.HARdataset(ds_test), batch_size=32, shuffle=False, collate_fn=collate)
+    train_loader = DataLoader(finetune.HARdataset(train_ds), batch_size=32, shuffle=True) # why is the batch size 32
+    test_loader = DataLoader(finetune.HARdataset(test_ds), batch_size=32, shuffle=False)
     
     num_classes = 15
     model_ft = finetune.CLIPFineTuner(model, num_classes).to(device)
