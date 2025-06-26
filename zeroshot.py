@@ -87,4 +87,7 @@ if __name__ == '__main__':
     model, preprocess = clip.load('ViT-B/32', device)
     model.to(device)
     
+    model.load_state_dict(torch.load("clip_finetuned_HAR.pth"))
+    model.eval()
+    
     zeroshot() 

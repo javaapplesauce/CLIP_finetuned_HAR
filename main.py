@@ -15,6 +15,9 @@ import torch.nn as nn
 
 
 class HFDataset(Dataset):
+    
+    # comment so i can push
+    
     def __init__(self, hf_dataset, preprocess):
         self.dataset   = hf_dataset
         self.preprocess = preprocess
@@ -35,7 +38,9 @@ if __name__ == '__main__':
     ### Load the dataset --> installed datasets and vision dependency
     dl_config = DownloadConfig(max_retries=10, use_etag=False)
     ds = load_dataset("Bingsu/Human_Action_Recognition", download_config=dl_config)
-    ds_train, ds_test = finetune.split_dataset(ds)
+    
+    ds_train = ds["train"]
+    ds_test  = ds["test"]
 
     
     ### model
@@ -47,8 +52,8 @@ if __name__ == '__main__':
     test_ds  = HFDataset(ds_test,  preprocess)
 
     # Create DataLoader for training and validation sets
-    train_loader = DataLoader(finetune.HARdataset(train_ds), batch_size=32, shuffle=True) # why is the batch size 32
-    test_loader = DataLoader(finetune.HARdataset(test_ds), batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True) # why is the batch size 32
+    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False)
     
     num_classes = 15
     model_ft = finetune.CLIPFineTuner(model, num_classes).to(device)
