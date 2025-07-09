@@ -1,0 +1,4 @@
+# Ignore PyTorch model checkpoint files
+*.pth
+*.pt
+
