@@ -81,25 +81,29 @@ class FineTune:
     def __init__(
         self,
         model: torch.nn.Module,
-        # loss: torch.nn.CrossEntropyLoss,
         train_data: DataLoader,
         val_data: DataLoader,
+        test_data: DataLoader,
         optimizer: torch.optim.Optimizer,
         gpu_id: int,
         save_every: int,
         lr: float,
         weight_decay: float,
-        scheduler: optim.lr_scheduler
+        scheduler: optim.lr_scheduler,
+        save_path: str = "best_model.pth"
     ) -> None:
         self.gpu_id = gpu_id
-        # self.loss = nn.CrossEntropyLoss()
         self.train_data = train_data
         self.val_data = val_data
+        self.test_data = test_data
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         self.save_every = save_every
         model.to(gpu_id)
         self.model = DDP(model, device_ids=[gpu_id], find_unused_parameters=True)
         self.scheduler = scheduler
+        self.save_path = save_path
+        self.best_acc = 0.0
+
     
     def _run_batch(self, source, targets):
         self.optimizer.zero_grad()
@@ -118,13 +122,15 @@ class FineTune:
             targets = targets.to(self.gpu_id)
             self._run_batch(source, targets)
         
-    def _save_checkpoint(self, epoch):
-        ckp = self.model.module.state_dict()
-        PATH = "checkpoint.pt"
-        torch.save(ckp, PATH)
-        print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
-    
-    
+    def _save_checkpoint(self, epoch, best: bool = False):
+        
+        ckp = {
+            'model_state': self.model.state_dict(),
+        }
+        
+        path = self.save_path if best else f"checkpoint_epoch{epoch}.pt"
+        torch.save(ckp, path)
+
     
     @staticmethod
     def _evaluate(model, loader, device, rank):
@@ -192,10 +198,66 @@ class FineTune:
                     f"F1: {metrics['f1']:.2f}% | "
                     f"mAP: {metrics['mAP']:.2f}%"
                 )
+                
+                if epoch % self.save_every == 0:
+                    self._save_checkpoint(epoch)
+                    
+                if metrics['acc'] > self.best_acc:
+                    self.best_acc = metrics['acc']
+                    self._save_checkpoint(epoch, best=True)
+                    
+        if self.gpu_id == 0:
+            map_location = {'cuda:0': f'cuda:{self.gpu_id}'} if torch.cuda.is_available() else 'cpu'
             
-            if self.gpu_id == 0 and epoch % self.save_every == 0:
-                self._save_checkpoint(epoch)
+            checkpoint = torch.load('best_model.pth', map_location=map_location)
+            self.model.load_state_dict(checkpoint['model_state'])
+            self.model.to(map_location)
+            self.model.eval()
+            
+            # 2. Prepare containers for predictions & labels
+            all_preds = []
+            all_labels = []
+            
+            # 3. Inference loop
+            with torch.no_grad():
+                for images, labels in self.test_data:
+                    # move to device
+                    images = images.to(map_location)
+                    labels = labels.to(map_location)
 
+                    # forward pass
+                    outputs = self.model(images)
+                    # if using a Hugging Face-style model, grab .logits
+                    logits = outputs.logits if hasattr(outputs, 'logits') else outputs
+
+                    # get predicted class
+                    preds = torch.argmax(logits, dim=1)
+
+                    # collect
+                    all_preds.append(preds.cpu())
+                    all_labels.append(labels.cpu())
+
+            # 4. Concatenate and compute metrics
+            all_preds = torch.cat(all_preds)
+            all_labels = torch.cat(all_labels)
+            
+            metrics = self._evaluate(self.model, self.test_data, map_location, self.gpu_id)
+            print(
+                f"test Accuracy: {metrics['acc']:.2f}% | "
+                f"Precision: {metrics['prec']:.2f}% | "
+                f"Recall: {metrics['rec']:.2f}% | "
+                f"F1: {metrics['f1']:.2f}% | "
+                f"mAP: {metrics['mAP']:.2f}%"
+            )
+
+            
+            
+            
+            
+            
+
+
+            
 
 def load_train_objs(num_labels=15, lr=1e-4, weight_decay=1e-4, device=None):
     
@@ -270,7 +332,10 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
     val_data = prepare_dataloader(val_dataset, batch_size)
     test_data = prepare_dataloader(test_dataset, batch_size)
     
-    trainer = FineTune(model, train_data, val_data, optimizer, rank, save_every, lr, weight_decay, scheduler)
+    trainer = FineTune(model, train_data, val_data, test_data, 
+                       optimizer, rank, save_every, 
+                       lr, weight_decay, scheduler, 
+                       save_path="best_model.pth")
     
     try:
         trainer.train(total_epochs)
