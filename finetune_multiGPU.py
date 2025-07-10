@@ -8,6 +8,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from transformers import AutoModelForImageClassification
+import torch.distributed as dist
 
 # Multiprocess imports
 import torch.multiprocessing as mp
@@ -32,6 +33,21 @@ def ddp_setup(rank, world_size):
     os.environ["MASTER_PORT"] = "12355" 
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+def gather_list(data_list):
+    """
+    Helper to gather a Python list from all processes.
+    Returns a flat list on all ranks.
+    """
+    world_size = dist.get_world_size()
+    gathered = [None] * world_size
+    # PyTorch ≥1.8: gather arbitrary Python objects
+    dist.all_gather_object(gathered, data_list)
+    # flatten
+    flat = []
+    for part in gathered:
+        flat.extend(part)
+    return flat
 
 class HFDataset(Dataset):
     """
@@ -108,16 +124,17 @@ class FineTune:
         torch.save(ckp, PATH)
         print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
     
+    
+    
     @staticmethod
-    def _evaluate(model, loader, device):
+    def _evaluate(model, loader, device, rank):
         """
         Evaluates the model on validation set. Returns dict of metrics.
         Metrics: accuracy, precision, recall, f1, mAP
         """
         model.eval()
-        all_preds = []
-        all_labels = []
-        all_probs = []
+        all_preds, all_labels, all_probs = [], [], []
+
 
         with torch.no_grad():
             for images, labels in loader:
@@ -125,11 +142,18 @@ class FineTune:
                 labels = labels.to(device)
                 logits = model(images).logits
                 probs = torch.softmax(logits, dim=1)
+                
                 preds = torch.argmax(probs, dim=1)
-
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(probs.cpu().numpy())
+                all_preds.extend(preds.cpu().tolist())
+                all_labels.extend(labels.cpu().tolist())
+                all_probs.extend(probs.cpu().tolist())
+                
+        all_preds = gather_list(all_preds)
+        all_labels = gather_list(all_labels)
+        all_probs = gather_list(all_probs)
+        
+        if rank != 0:
+            return None
 
         # Compute metrics
         total = len(all_labels)
@@ -150,21 +174,24 @@ class FineTune:
         mAP = np.mean(APs) * 100
 
         return {"acc": acc, "prec": prec, "rec": rec, "f1": f1, "mAP": mAP}
-        
+    
+    
+    
     def train(self, max_epochs: int):
         for epoch in range(max_epochs):
             
             self._run_epoch(epoch)
             self.scheduler.step()
             
-            metrics = self._evaluate(self.model, self.val_data, self.gpu_id)
-            print(
-                f"Val Accuracy: {metrics['acc']:.2f}% | "
-                f"Precision: {metrics['prec']:.2f}% | "
-                f"Recall: {metrics['rec']:.2f}% | "
-                f"F1: {metrics['f1']:.2f}% | "
-                f"mAP: {metrics['mAP']:.2f}%"
-            )
+            metrics = self._evaluate(self.model, self.val_data, self.gpu_id, self.gpu_id)
+            if self.gpu_id == 0:
+                print(
+                    f"Val Accuracy: {metrics['acc']:.2f}% | "
+                    f"Precision: {metrics['prec']:.2f}% | "
+                    f"Recall: {metrics['rec']:.2f}% | "
+                    f"F1: {metrics['f1']:.2f}% | "
+                    f"mAP: {metrics['mAP']:.2f}%"
+                )
             
             if self.gpu_id == 0 and epoch % self.save_every == 0:
                 self._save_checkpoint(epoch)
