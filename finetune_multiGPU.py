@@ -30,7 +30,7 @@ def ddp_setup(rank, world_size):
     peen
     """
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355" 
+    os.environ["MASTER_PORT"] = "12356" 
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
@@ -205,58 +205,9 @@ class FineTune:
                 if metrics['acc'] > self.best_acc:
                     self.best_acc = metrics['acc']
                     self._save_checkpoint(epoch, best=True)
-                    
-        if self.gpu_id == 0:
-            map_location = {'cuda:0': f'cuda:{self.gpu_id}'} if torch.cuda.is_available() else 'cpu'
-            
-            checkpoint = torch.load('best_model.pth', map_location=map_location)
-            self.model.load_state_dict(checkpoint['model_state'])
-            self.model.to(map_location)
-            self.model.eval()
-            
-            # 2. Prepare containers for predictions & labels
-            all_preds = []
-            all_labels = []
-            
-            # 3. Inference loop
-            with torch.no_grad():
-                for images, labels in self.test_data:
-                    # move to device
-                    images = images.to(map_location)
-                    labels = labels.to(map_location)
-
-                    # forward pass
-                    outputs = self.model(images)
-                    # if using a Hugging Face-style model, grab .logits
-                    logits = outputs.logits if hasattr(outputs, 'logits') else outputs
-
-                    # get predicted class
-                    preds = torch.argmax(logits, dim=1)
-
-                    # collect
-                    all_preds.append(preds.cpu())
-                    all_labels.append(labels.cpu())
-
-            # 4. Concatenate and compute metrics
-            all_preds = torch.cat(all_preds)
-            all_labels = torch.cat(all_labels)
-            
-            metrics = self._evaluate(self.model, self.test_data, map_location, self.gpu_id)
-            print(
-                f"test Accuracy: {metrics['acc']:.2f}% | "
-                f"Precision: {metrics['prec']:.2f}% | "
-                f"Recall: {metrics['rec']:.2f}% | "
-                f"F1: {metrics['f1']:.2f}% | "
-                f"mAP: {metrics['mAP']:.2f}%"
-            )
 
             
             
-            
-            
-            
-
-
             
 
 def load_train_objs(num_labels=15, lr=1e-4, weight_decay=1e-4, device=None):
@@ -341,6 +292,10 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
         trainer.train(total_epochs)
     finally:
         destroy_process_group()
+        
+    
+    
+    
 
 if __name__ == "__main__":
     import argparse
