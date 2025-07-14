@@ -39,15 +39,17 @@ def gather_list(data_list):
     Helper to gather a Python list from all processes.
     Returns a flat list on all ranks.
     """
-    world_size = dist.get_world_size()
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
     gathered = [None] * world_size
-    # PyTorch ≥1.8: gather arbitrary Python objects
-    dist.all_gather_object(gathered, data_list)
-    # flatten
-    flat = []
-    for part in gathered:
-        flat.extend(part)
-    return flat
+    if world_size > 1:
+        dist.all_gather_object(gathered, data_list)
+        # flatten
+        flat = []
+        for part in gathered:
+            flat.extend(part)
+        return flat
+    else:
+        return data_list
 
 class HFDataset(Dataset):
     """
@@ -115,13 +117,23 @@ class FineTune:
     
     def _run_epoch(self, epoch):
         b_sz = len(next(iter(self.train_data))[0])
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
+        steps = len(self.train_data)
+        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {steps}")
         self.train_data.sampler.set_epoch(epoch)
+        
         for source, targets in self.train_data:
             source = source.to(self.gpu_id)
             targets = targets.to(self.gpu_id)
-            self._run_batch(source, targets)
-        
+            
+            self.optimizer.zero_grad()
+            output = self.model(source)
+            logits  = output.logits
+            loss = F.cross_entropy(logits, targets)
+            loss.backward()
+            self.optimizer.step()
+            
+            
+                    
     def _save_checkpoint(self, epoch, best: bool = False):
         
         ckp = {
@@ -138,6 +150,7 @@ class FineTune:
         Evaluates the model on validation set. Returns dict of metrics.
         Metrics: accuracy, precision, recall, f1, mAP
         """
+        
         model.eval()
         all_preds, all_labels, all_probs = [], [], []
 
@@ -146,36 +159,48 @@ class FineTune:
             for images, labels in loader:
                 images = images.to(device)
                 labels = labels.to(device)
-                logits = model(images).logits
+                outputs = model(images)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
                 probs = torch.softmax(logits, dim=1)
-                
                 preds = torch.argmax(probs, dim=1)
+                
+                
+                
                 all_preds.extend(preds.cpu().tolist())
                 all_labels.extend(labels.cpu().tolist())
                 all_probs.extend(probs.cpu().tolist())
                 
-        all_preds = gather_list(all_preds)
-        all_labels = gather_list(all_labels)
-        all_probs = gather_list(all_probs)
-        
+                
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if world_size > 1:
+            all_preds = gather_list(all_preds)
+            all_labels = gather_list(all_labels)
+            all_probs = gather_list(all_probs)
+            rank_id = dist.get_rank()
+        else:
+            rank_id = 0
         if rank != 0:
             return None
 
-        # Compute metrics
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+        
         total = len(all_labels)
-        correct = np.sum(np.array(all_preds) == np.array(all_labels))
+        correct = (all_preds == all_labels).sum()
         acc = 100.0 * correct / total
+
         prec = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
         rec  = recall_score(all_labels, all_preds, average='macro', zero_division=0) * 100
         f1   = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
 
-        #   mAP: average precision per class then mean
-        num_classes = len(set(all_labels))
-        labels_onehot = np.zeros((total, num_classes), dtype=int)
-        labels_onehot[np.arange(total), all_labels] = 1
+        num_classes = len(np.unique(all_labels))
         APs = []
+        labels_oneshot = np.zeros((total, num_classes), dtype=int)
+        labels_oneshot[np.arange(total), all_labels] = 1
         for c in range(num_classes):
-            ap_c = average_precision_score(labels_onehot[:, c], np.array(all_probs)[:, c])
+            ap_c = average_precision_score(labels_oneshot[:, c], np.array(all_probs)[:, c])
+            if np.isnan(ap_c):
+                ap_c = 0.0
             APs.append(ap_c)
         mAP = np.mean(APs) * 100
 
@@ -205,6 +230,21 @@ class FineTune:
                 if metrics['acc'] > self.best_acc:
                     self.best_acc = metrics['acc']
                     self._save_checkpoint(epoch, best=True)
+                    
+        
+        best_ckp = torch.load(self.save_path, map_location=f"cuda:{self.gpu_id}")
+        self.model.load_state_dict(best_ckp['model_state'])
+        test_metrics = self._evaluate(self.model, self.test_data, self.gpu_id, self.gpu_id)
+        if self.gpu_id == 0 and test_metrics:
+            print(
+                "running test|"
+                f"{test_metrics['acc']:.2f}|"
+                f"{test_metrics['prec']:.2f}|"
+                f"{test_metrics['rec']:.2f}|"
+                f"{test_metrics['f1']:.2f}|"
+                f"{test_metrics['mAP']:.2f}|"
+            )
+
 
             
             
@@ -226,7 +266,7 @@ def load_train_objs(num_labels=15, lr=1e-4, weight_decay=1e-4, device=None):
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
     # loads scheduler
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     
     return ds, model, optimizer, scheduler

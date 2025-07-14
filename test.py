@@ -112,38 +112,11 @@ def main(batch_size: int):
     
     model.load_state_dict(stripped_sd)
     model.to(device)
-    model.eval()
     
-    # 2. Prepare containers for predictions & labels
-    all_preds = []
-    all_labels = []
+    metrics = FineTune._evaluate(model, test_data, device)
     
-    # 3. Inference loop
-    with torch.no_grad():
-        for images, labels in test_data:
-            # move to device
-            images = images.to(device)
-            labels = labels.to(device)
-
-            # forward pass
-            outputs = model(images)
-            # if using a Hugging Face-style model, grab .logits
-            logits = outputs.logits if hasattr(outputs, 'logits') else outputs
-
-            # get predicted class
-            preds = torch.argmax(logits, dim=1)
-
-            # collect
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
-
-    # 4. Concatenate and compute metrics
-    all_preds = torch.cat(all_preds)
-    all_labels = torch.cat(all_labels)
-    
-    metrics = evaluate(model, test_data, device)
     print(
-        f"test Accuracy: {metrics['acc']:.2f}% | "
+        f"Test Accuracy: {metrics['acc']:.2f}% | "
         f"Precision: {metrics['prec']:.2f}% | "
         f"Recall: {metrics['rec']:.2f}% | "
         f"F1: {metrics['f1']:.2f}% | "
