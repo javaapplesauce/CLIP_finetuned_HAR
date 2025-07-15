@@ -137,7 +137,11 @@ class FineTune:
     def _save_checkpoint(self, epoch, best: bool = False):
         
         ckp = {
-            'model_state': self.model.state_dict(),
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict(),
+            "epoch": epoch,
+            "best_acc": self.best_acc,
         }
         
         path = self.save_path if best else f"checkpoint_epoch{epoch}.pt"
@@ -203,7 +207,6 @@ class FineTune:
                 ap_c = 0.0
             APs.append(ap_c)
         mAP = np.mean(APs) * 100
-
         return {"acc": acc, "prec": prec, "rec": rec, "f1": f1, "mAP": mAP}
     
     
@@ -215,7 +218,7 @@ class FineTune:
             self.scheduler.step()
             
             metrics = self._evaluate(self.model, self.val_data, self.gpu_id, self.gpu_id)
-            if self.gpu_id == 0:
+            if self.gpu_id == 0 and metrics:
                 print(
                     f"Val Accuracy: {metrics['acc']:.2f}% | "
                     f"Precision: {metrics['prec']:.2f}% | "
@@ -223,7 +226,6 @@ class FineTune:
                     f"F1: {metrics['f1']:.2f}% | "
                     f"mAP: {metrics['mAP']:.2f}%"
                 )
-                
                 if epoch % self.save_every == 0:
                     self._save_checkpoint(epoch)
                     
@@ -232,7 +234,7 @@ class FineTune:
                     self._save_checkpoint(epoch, best=True)
                     
         
-        best_ckp = torch.load(self.save_path, map_location=f"cuda:{self.gpu_id}")
+        best_ckp = torch.load(self.save_path, map_location=f"cuda:{self.gpu_id}", weights_only=False)
         self.model.load_state_dict(best_ckp['model_state'])
         test_metrics = self._evaluate(self.model, self.test_data, self.gpu_id, self.gpu_id)
         if self.gpu_id == 0 and test_metrics:
@@ -244,27 +246,38 @@ class FineTune:
                 f"{test_metrics['f1']:.2f}|"
                 f"{test_metrics['mAP']:.2f}|"
             )
+    
+    def resume_train(self, checkpoint_path: str, max_epochs: int):
+        
+        ckp = torch.load(checkpoint_path, map_location=f"cuda:{self.gpu_id}")
+        self.model.load_state_dict(ckp["model_state"])
+        self.optimizer.load_state_dict(ckp["optimizer_state"])
+        self.scheduler.load_state_dict(ckp["scheduler_state"])
+        self.best_acc = ckp.get("best_acc", 0.0)
+        start_epoch = ckp["epoch"] + 1
+        if self.gpu_id == 0:
+            print(f"Resuming from epoch {start_epoch} (best_acc={self.best_acc:.2f}%)")
+        # Continue training
+        self.train(max_epochs=max_epochs, start_epoch=start_epoch)
+
 
 
             
-            
+      
             
 
 def load_train_objs(num_labels=15, lr=1e-4, weight_decay=1e-4, device=None):
     
     # loads dataset
     ds = load_dataset("Bingsu/Human_Action_Recognition")  # load your dataset
-
     # loads model
     model = AutoModelForImageClassification.from_pretrained(
         "openai/clip-vit-base-patch32",
         num_labels=15)    
     
     
-    
     # loads optimizer
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    
     # loads scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
@@ -284,7 +297,7 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
 
 
 def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_size: int, 
-         lr: float, weight_decay: float):
+         lr: float, weight_decay: float, resume_path: str | None = None, ):
     
     ddp_setup(rank, world_size)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -329,7 +342,11 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
                        save_path="best_model.pth")
     
     try:
-        trainer.train(total_epochs)
+        if resume_path is not None:
+            trainer.resume_train(resume_path, total_epochs)
+        else:
+            trainer.train(total_epochs)
+        
     finally:
         destroy_process_group()
         
@@ -343,12 +360,22 @@ if __name__ == "__main__":
     parser.add_argument('total_epochs', type=int, help='Total epochs to train the model')
     parser.add_argument('save_every', type=int, help='How often to save a snapshot')
     parser.add_argument('--batch_size', default=48, type=int, help='Input batch size on each device (default: 48)')
+    parser.add_argument("--lr", default=5e-5, type=float, help="Learning rate")
+    parser.add_argument("--weight_decay", default=1e-2, type=float, help="Weight decay")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        type=str,
+        help="Path to a checkpoint (.pt) to resume training from",
+    )
+
     args = parser.parse_args()
 
     world_size = torch.cuda.device_count()
-    mp.spawn(main, args=(world_size, 
-                         args.save_every, 
-                         args.total_epochs, 
-                         args.batch_size, 
-                         5e-5,
-                         1e-2), nprocs=world_size)
+    mp.spawn(main, args=(world_size,
+                         args.save_every,
+                         args.total_epochs,
+                         args.batch_size,
+                         args.lr,
+                         args.weight_decay,
+                         args.resume), nprocs=world_size)
