@@ -72,11 +72,15 @@ class HFDataset(Dataset):
     
     @staticmethod
     def transform():
-        return transforms.Compose([
-            transforms.Resize((224, 224)),
+        base = [
+            transforms.Resize(256),
+            transforms.RandomResizedCrop(224, scale=(0.8,1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=.2, contrast=.2, saturation=.2, hue=.1),
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
-            ])
+            transforms.Normalize((0.5,)*3, (0.5,)*3),
+        ]
+        return transforms.Compose(base)
 
 class FineTune:
     
