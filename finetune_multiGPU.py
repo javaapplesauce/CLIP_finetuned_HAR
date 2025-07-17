@@ -23,6 +23,8 @@ from collections import Counter
 # Metrics imports
 from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score
 import numpy as np
+import random
+import wandb
 
 
 def ddp_setup(rank, world_size):
@@ -118,6 +120,8 @@ class FineTune:
         loss = F.cross_entropy(logits, targets)
         loss.backward()
         self.optimizer.step()
+        
+
     
     def _run_epoch(self, epoch):
         b_sz = len(next(iter(self.train_data))[0])
@@ -136,6 +140,13 @@ class FineTune:
             loss.backward()
             self.optimizer.step()
             
+            # — W&B: log training loss & step
+            if self.gpu_id == 0:
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/epoch": epoch,
+                })
+            
             
                     
     def _save_checkpoint(self, epoch, best: bool = False):
@@ -153,7 +164,7 @@ class FineTune:
 
     
     @staticmethod
-    def _evaluate(model, loader, device, rank):
+    def _evaluate(model, loader, device):
         """
         Evaluates the model on validation set. Returns dict of metrics.
         Metrics: accuracy, precision, recall, f1, mAP
@@ -187,7 +198,7 @@ class FineTune:
             rank_id = dist.get_rank()
         else:
             rank_id = 0
-        if rank != 0:
+        if rank_id != 0:
             return None
 
         all_preds = np.array(all_preds)
@@ -221,7 +232,8 @@ class FineTune:
             self._run_epoch(epoch)
             self.scheduler.step()
             
-            metrics = self._evaluate(self.model, self.val_data, self.gpu_id, self.gpu_id)
+            
+            metrics = self._evaluate(self.model, self.val_data, self.gpu_id)
             if self.gpu_id == 0 and metrics:
                 print(
                     f"Val Accuracy: {metrics['acc']:.2f}% | "
@@ -230,6 +242,16 @@ class FineTune:
                     f"F1: {metrics['f1']:.2f}% | "
                     f"mAP: {metrics['mAP']:.2f}%"
                 )
+                
+                wandb.log({
+                    "val/acc": metrics["acc"],
+                    "val/prec": metrics["prec"],
+                    "val/rec": metrics["rec"],
+                    "val/f1": metrics["f1"],
+                    "val/mAP": metrics["mAP"],
+                    "val/epoch": epoch
+                })
+                
                 if epoch % self.save_every == 0:
                     self._save_checkpoint(epoch)
                     
@@ -240,7 +262,7 @@ class FineTune:
         
         best_ckp = torch.load(self.save_path, map_location=f"cuda:{self.gpu_id}", weights_only=False)
         self.model.load_state_dict(best_ckp['model_state'])
-        test_metrics = self._evaluate(self.model, self.test_data, self.gpu_id, self.gpu_id)
+        test_metrics = self._evaluate(self.model, self.test_data, self.gpu_id)
         if self.gpu_id == 0 and test_metrics:
             print(
                 "running test|"
@@ -250,6 +272,14 @@ class FineTune:
                 f"{test_metrics['f1']:.2f}|"
                 f"{test_metrics['mAP']:.2f}|"
             )
+            
+            wandb.log({
+                "test/acc": test_metrics["acc"],
+                "test/prec": test_metrics["prec"],
+                "test/rec": test_metrics["rec"],
+                "test/f1": test_metrics["f1"],
+                "test/mAP": test_metrics["mAP"]
+            })
     
     def resume_train(self, checkpoint_path: str, max_epochs: int):
         
@@ -302,11 +332,13 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
 
 def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_size: int, 
          lr: float, weight_decay: float, resume_path: str | None = None, ):
-    
+        
     ddp_setup(rank, world_size)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     
+   
+
     ### Hyperparameters
     learning_rate = 5e-5
     weight_decay = 1e-2
@@ -318,6 +350,10 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
         weight_decay=weight_decay,
         device=device
     )
+    
+    for n, p in model.named_parameters():
+        if "text_model" in n:      # freeze text tower
+            p.requires_grad_(False)
     
     ds_train = dataset["train"]
     # Create train/val split since official test labels are all zero
@@ -339,6 +375,20 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
     train_data = prepare_dataloader(train_dataset, batch_size)
     val_data = prepare_dataloader(val_dataset, batch_size)
     test_data = prepare_dataloader(test_dataset, batch_size)
+    
+    if rank == 0:
+        wandb.init(
+            project="columbia-university",      # or whatever slug you see in your URL
+            config={                            # snap in your hyperparams
+                "lr":       lr,
+                "weight_decay": weight_decay,
+                "batch_size": batch_size,
+                "save_every": save_every,
+                "total_epochs": total_epochs
+            }
+        )
+        wandb.watch(model, log="all", log_freq=100)
+        wandb.watch_parameters = False
     
     trainer = FineTune(model, train_data, val_data, test_data, 
                        optimizer, rank, save_every, 
