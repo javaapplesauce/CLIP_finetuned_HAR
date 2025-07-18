@@ -9,6 +9,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from transformers import AutoModelForImageClassification
 import torch.distributed as dist
+from torchvision.transforms import InterpolationMode
+from PIL import Image
 
 # Multiprocess imports
 import torch.multiprocessing as mp
@@ -25,6 +27,12 @@ from sklearn.metrics import precision_score, recall_score, f1_score, average_pre
 import numpy as np
 import random
 import wandb
+import time
+import psutil
+from datetime import datetime
+
+CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
+CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
 
 
 def ddp_setup(rank, world_size):
@@ -53,6 +61,20 @@ def gather_list(data_list):
     else:
         return data_list
 
+class SignLoss(nn.Module):
+    def forward(self, class_logits, targets):
+        assert class_logits.size() == targets.size(), "dimension mismatch"
+
+        batch_size, n_classes = class_logits.size()
+        zeros = torch.zeros(batch_size).view(batch_size, -1).to(targets.device)
+        
+        class_logits[targets == 1] *= -1
+        class_logits = torch.cat((zeros, class_logits), dim=1)
+
+        loss = torch.logsumexp(class_logits, 1)
+
+        return loss
+
 class HFDataset(Dataset):
     """
     Wraps a Hugging Face Dataset for PyTorch DataLoader.
@@ -74,15 +96,26 @@ class HFDataset(Dataset):
     
     @staticmethod
     def transform():
-        base = [
-            transforms.Resize(256),
-            transforms.RandomResizedCrop(224, scale=(0.8,1.0)),
+        return transforms.Compose([
+            transforms.RandomResizedCrop(
+                224,
+                scale=(0.08, 1.0),               # default in PyTorch
+                ratio=(0.75, 1.3333333),
+                interpolation=InterpolationMode.BICUBIC
+            ),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=.2, contrast=.2, saturation=.2, hue=.1),
             transforms.ToTensor(),
-            transforms.Normalize((0.5,)*3, (0.5,)*3),
-        ]
-        return transforms.Compose(base)
+            transforms.Normalize(CLIP_MEAN, CLIP_STD),
+        ])
+        # base = [
+        #     transforms.Resize(256),
+        #     transforms.RandomResizedCrop(224, scale=(0.8,1.0)),
+        #     transforms.RandomHorizontalFlip(p=0.5),
+        #     transforms.ColorJitter(brightness=.2, contrast=.2, saturation=.2, hue=.1),
+        #     transforms.ToTensor(),
+        #     transforms.Normalize((0.5,)*3, (0.5,)*3),
+        # ]
+        # return transforms.Compose(base)
 
 class FineTune:
     
@@ -124,26 +157,40 @@ class FineTune:
 
     
     def _run_epoch(self, epoch):
+        criterion = SignLoss()
         b_sz = len(next(iter(self.train_data))[0])
         steps = len(self.train_data)
         print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {steps}")
-        self.train_data.sampler.set_epoch(epoch)
         
-        for source, targets in self.train_data:
+        if self.gpu_id == 0:
+            # Log LR at epoch start
+            wandb.log({"train/lr": self.optimizer.param_groups[0]['lr']})
+            print(f"Starting Epoch {epoch} | LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+            
+        self.train_data.sampler.set_epoch(epoch)
+        for it, (source, targets) in enumerate(self.train_data):
+            
+            start_time = time.time()
+            
             source = source.to(self.gpu_id)
             targets = targets.to(self.gpu_id)
             
             self.optimizer.zero_grad()
             output = self.model(source)
             logits  = output.logits
-            loss = F.cross_entropy(logits, targets)
+            targets_onehot = torch.nn.functional.one_hot(targets, num_classes=15).float()
+            
+            loss_values = criterion(logits, targets_onehot.to(logits.device))
+            loss = loss_values.mean()
             loss.backward()
             self.optimizer.step()
             
+            batch_time = time.time() - start_time
             # — W&B: log training loss & step
-            if self.gpu_id == 0:
+            if self.gpu_id == 0 and it % 10 == 0:
                 wandb.log({
                     "train/loss": loss.item(),
+                    "train/batch_time": batch_time,
                     "train/epoch": epoch,
                 })
             
@@ -178,12 +225,12 @@ class FineTune:
             for images, labels in loader:
                 images = images.to(device)
                 labels = labels.to(device)
+                
                 outputs = model(images)
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                
                 probs = torch.softmax(logits, dim=1)
                 preds = torch.argmax(probs, dim=1)
-                
-                
                 
                 all_preds.extend(preds.cpu().tolist())
                 all_labels.extend(labels.cpu().tolist())
@@ -207,7 +254,6 @@ class FineTune:
         total = len(all_labels)
         correct = (all_preds == all_labels).sum()
         acc = 100.0 * correct / total
-
         prec = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
         rec  = recall_score(all_labels, all_preds, average='macro', zero_division=0) * 100
         f1   = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
@@ -226,7 +272,8 @@ class FineTune:
     
     
     
-    def train(self, max_epochs: int):
+    def train(self, max_epochs: int):    
+            
         for epoch in range(max_epochs):
             
             self._run_epoch(epoch)
@@ -249,7 +296,6 @@ class FineTune:
                     "val/rec": metrics["rec"],
                     "val/f1": metrics["f1"],
                     "val/mAP": metrics["mAP"],
-                    "val/epoch": epoch
                 })
                 
                 if epoch % self.save_every == 0:
@@ -274,11 +320,8 @@ class FineTune:
             )
             
             wandb.log({
-                "test/acc": test_metrics["acc"],
-                "test/prec": test_metrics["prec"],
-                "test/rec": test_metrics["rec"],
-                "test/f1": test_metrics["f1"],
-                "test/mAP": test_metrics["mAP"]
+                "test/acc": test_metrics['acc'],
+                "test/mAP": test_metrics['mAP']
             })
     
     def resume_train(self, checkpoint_path: str, max_epochs: int):
@@ -377,8 +420,9 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
     test_data = prepare_dataloader(test_dataset, batch_size)
     
     if rank == 0:
+        run_name = f"HAR-{datetime.now():%Y%m%d-%H%M%S}"
         wandb.init(
-            project="columbia-university",      # or whatever slug you see in your URL
+            project="HAR",      # or whatever slug you see in your URL
             config={                            # snap in your hyperparams
                 "lr":       lr,
                 "weight_decay": weight_decay,
