@@ -29,7 +29,7 @@ import random
 import wandb
 import time
 import psutil
-from datetime import datetime
+import datetime
 
 CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
 CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
@@ -42,7 +42,7 @@ def ddp_setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12356" 
     torch.cuda.set_device(rank)
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    init_process_group(backend="nccl", rank=rank, world_size=world_size, timeout=datetime.timedelta(minutes=10))
 
 def gather_list(data_list):
     """
@@ -96,17 +96,28 @@ class HFDataset(Dataset):
     
     @staticmethod
     def transform():
+        
         return transforms.Compose([
-            transforms.RandomResizedCrop(
-                224,
-                scale=(0.08, 1.0),               # default in PyTorch
-                ratio=(0.75, 1.3333333),
-                interpolation=InterpolationMode.BICUBIC
-            ),
-            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomResizedCrop(224, scale=(0.5,1.0), interpolation=InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(0.5),
+            transforms.RandAugment(num_ops=2, magnitude=9),
+            transforms.ColorJitter(brightness=.2, contrast=.2, saturation=.2, hue=.1),
             transforms.ToTensor(),
             transforms.Normalize(CLIP_MEAN, CLIP_STD),
+            transforms.RandomErasing(p=0.3, scale=(0.02,0.33), ratio=(0.3,3.3)),
         ])
+        
+        # return transforms.Compose([
+        #     transforms.RandomResizedCrop(
+        #         224,
+        #         scale=(0.08, 1.0),               # default in PyTorch
+        #         ratio=(0.75, 1.3333333),
+        #         interpolation=InterpolationMode.BICUBIC
+        #     ),
+        #     transforms.RandomHorizontalFlip(p=0.5),
+        #     transforms.ToTensor(),
+        #     transforms.Normalize(CLIP_MEAN, CLIP_STD),
+        # ])
         # base = [
         #     transforms.Resize(256),
         #     transforms.RandomResizedCrop(224, scale=(0.8,1.0)),
@@ -137,7 +148,7 @@ class FineTune:
         self.train_data = train_data
         self.val_data = val_data
         self.test_data = test_data
-        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.optimizer = optimizer
         self.save_every = save_every
         model.to(gpu_id)
         self.model = DDP(model, device_ids=[gpu_id], find_unused_parameters=True)
@@ -205,9 +216,10 @@ class FineTune:
             "epoch": epoch,
             "best_acc": self.best_acc,
         }
-        
-        path = self.save_path if best else f"checkpoint_epoch{epoch}.pt"
-        torch.save(ckp, path)
+        if dist.get_rank() == 0:
+            path = self.save_path if best else f"checkpoint_epoch{epoch}.pt"
+            torch.save(ckp, path)
+        dist.barrier()
 
     
     @staticmethod
@@ -305,24 +317,27 @@ class FineTune:
                     self.best_acc = metrics['acc']
                     self._save_checkpoint(epoch, best=True)
                     
-        
-        best_ckp = torch.load(self.save_path, map_location=f"cuda:{self.gpu_id}", weights_only=False)
-        self.model.load_state_dict(best_ckp['model_state'])
-        test_metrics = self._evaluate(self.model, self.test_data, self.gpu_id)
-        if self.gpu_id == 0 and test_metrics:
-            print(
-                "running test|"
-                f"{test_metrics['acc']:.2f}|"
-                f"{test_metrics['prec']:.2f}|"
-                f"{test_metrics['rec']:.2f}|"
-                f"{test_metrics['f1']:.2f}|"
-                f"{test_metrics['mAP']:.2f}|"
-            )
+        # ckpt_list = [None]
+        # if dist.get_rank() == 0:
+        #     ckpt_list[0] = torch.load(self.save_path, map_location=f"cuda:{self.gpu_id}", weights_only=False)
+        # dist.broadcast_object_list(ckpt_list, src=0)
+        # best_ckp = ckpt_list[0]
+        # self.model.load_state_dict(best_ckp['model_state'])
+        # test_metrics = self._evaluate(self.model, self.test_data, self.gpu_id)
+        # if self.gpu_id == 0 and test_metrics:
+        #     print(
+        #         "running test|"
+        #         f"{test_metrics['acc']:.2f}|"
+        #         f"{test_metrics['prec']:.2f}|"
+        #         f"{test_metrics['rec']:.2f}|"
+        #         f"{test_metrics['f1']:.2f}|"
+        #         f"{test_metrics['mAP']:.2f}|"
+        #     )
             
-            wandb.log({
-                "test/acc": test_metrics['acc'],
-                "test/mAP": test_metrics['mAP']
-            })
+        #     wandb.log({
+        #         "test/acc": test_metrics['acc'],
+        #         "test/mAP": test_metrics['mAP']
+        #     })
     
     def resume_train(self, checkpoint_path: str, max_epochs: int):
         
@@ -420,7 +435,7 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
     test_data = prepare_dataloader(test_dataset, batch_size)
     
     if rank == 0:
-        run_name = f"HAR-{datetime.now():%Y%m%d-%H%M%S}"
+        run_name = f"HAR-{datetime.datetime.now():%Y%m%d-%H%M%S}"
         wandb.init(
             project="HAR",      # or whatever slug you see in your URL
             config={                            # snap in your hyperparams
