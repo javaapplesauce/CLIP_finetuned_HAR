@@ -5,6 +5,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
+    MultiStepLR,
+    ReduceLROnPlateau,
+    SequentialLR,
+    LinearLR
+)
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from transformers import AutoModelForImageClassification
@@ -306,23 +314,7 @@ class FineTune:
                     self._save_checkpoint(epoch, best=True)
                     
         
-        best_ckp = torch.load(self.save_path, map_location=f"cuda:{self.gpu_id}", weights_only=False)
-        self.model.load_state_dict(best_ckp['model_state'])
-        test_metrics = self._evaluate(self.model, self.test_data, self.gpu_id)
-        if self.gpu_id == 0 and test_metrics:
-            print(
-                "running test|"
-                f"{test_metrics['acc']:.2f}|"
-                f"{test_metrics['prec']:.2f}|"
-                f"{test_metrics['rec']:.2f}|"
-                f"{test_metrics['f1']:.2f}|"
-                f"{test_metrics['mAP']:.2f}|"
-            )
-            
-            wandb.log({
-                "test/acc": test_metrics['acc'],
-                "test/mAP": test_metrics['mAP']
-            })
+        
     
     def resume_train(self, checkpoint_path: str, max_epochs: int):
         
@@ -355,11 +347,56 @@ def load_train_objs(num_labels=15, lr=1e-4, weight_decay=1e-4, device=None):
     
     # loads optimizer
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    eta_min     = lr * 0.01
+    
+    
+    eta_min  = lr * 0.01   # floor at 1% of initial lr
+    total_epochs = 15
+    
+    warmup_epochs = 2   # ~20% of 10
+    cosine_epochs = 10 - warmup_epochs
+    
+    # scheduler_multistep = MultiStepLR(
+    #     optimizer,
+    #     milestones=[4, 7],  # drop at ~40% and ~70% through training
+    #     gamma=0.1
+    # )
+
+    # scheduler_plateau = ReduceLROnPlateau(
+    #     optimizer,
+    #     mode='max',          # watching val mAP
+    #     factor=0.5,          # halve the LR
+    #     patience=2,          # wait 2 epochs with no val mAP gain
+    #     threshold=1e-3    )
+
+    # scheduler_warmup = SequentialLR(
+    #     optimizer,
+    #     schedulers=[
+    #     LinearLR(optimizer, start_factor=1e-6/lr, end_factor=1.0, total_iters=warmup_epochs),
+    #     CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=eta_min)
+    #     ],
+    #     milestones=[warmup_epochs]
+    # )
+    
     # loads scheduler
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    scheduler_restarts = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=5,           # first cycle = 5 epochs
+        T_mult=1,        # keep cycle length constant at 5
+        eta_min=eta_min
+    )
+    
+    # scheduler = CosineAnnealingLR(
+    #     optimizer,
+    #     T_max=10,        # one full cosine cycle over your 10 epochs
+    #     eta_min=eta_min
+    # )
+    
+    # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     
-    return ds, model, optimizer, scheduler
+    return ds, model, optimizer, scheduler_restarts
 
 
 
@@ -421,8 +458,7 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
         wandb.init(
             project="HAR",      # or whatever slug you see in your URL
             group="lr_finetuning", 
-            tags=["lr=5e-6"],
-            tags=["wd=1e-3"],  
+            tags=["lr=1e-5", "wd=3e-4"],
             config={                            # snap in your hyperparams
                 "lr":       lr,
                 "weight_decay": weight_decay,
@@ -447,6 +483,26 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
         
     finally:
         destroy_process_group()
+        
+        # —— now that all DDP processes are torn down, run final test on rank 0
+        if rank == 0:
+            best_ckp = torch.load("best_model.pth", map_location="cuda:0", weights_only=False)
+            # load into your non-DDP model
+            trainer.model.load_state_dict(best_ckp['model_state'])
+            
+            test_metrics = trainer._evaluate(trainer.model, test_data, device="cuda:0")
+            print(
+                "running test|"
+                f"{test_metrics['acc']:.2f}|"
+                f"{test_metrics['prec']:.2f}|"
+                f"{test_metrics['rec']:.2f}|"
+                f"{test_metrics['f1']:.2f}|"
+                f"{test_metrics['mAP']:.2f}|"
+            )
+            wandb.log({
+                "test/acc": test_metrics['acc'],
+                "test/mAP": test_metrics['mAP']
+            })
         
     
     
