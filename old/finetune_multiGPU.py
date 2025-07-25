@@ -38,6 +38,9 @@ import wandb
 import time
 import psutil
 from datetime import datetime, timedelta
+import sys
+import math
+import pandas
 
 CLIP_MEAN = (0.48145466, 0.4578275,  0.40821073)
 CLIP_STD  = (0.26862954, 0.26130258, 0.27577711)
@@ -104,6 +107,19 @@ class HFDataset(Dataset):
     
     @staticmethod
     def transform():
+        
+        return transforms.Compose([
+
+            transforms.RandomResizedCrop(
+                224,
+                scale=(0.9, 1.0),               # default in PyTorch
+                interpolation=InterpolationMode.BICUBIC
+            ),
+            transforms.Lambda(lambda img: img.convert("RGB")),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+        ])
+        
         # return transforms.Compose([
         #     transforms.RandomResizedCrop(
         #         224,
@@ -115,15 +131,16 @@ class HFDataset(Dataset):
         #     transforms.ToTensor(),
         #     transforms.Normalize(CLIP_MEAN, CLIP_STD),
         # ])
-        base = [
-            transforms.Resize(256),
-            transforms.RandomResizedCrop(224, scale=(0.8,1.0)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=.2, contrast=.2, saturation=.2, hue=.1),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,)*3, (0.5,)*3),
-        ]
-        return transforms.Compose(base)
+
+        # base = [
+        #     transforms.Resize(256),
+        #     transforms.RandomResizedCrop(224, scale=(0.8,1.0)),
+        #     transforms.RandomHorizontalFlip(p=0.5),
+        #     transforms.ColorJitter(brightness=.2, contrast=.2, saturation=.2, hue=.1),
+        #     transforms.ToTensor(),
+        #     transforms.Normalize((0.5,)*3, (0.5,)*3),
+        # ]
+        # return transforms.Compose(base)
 
 class FineTune:
     
@@ -176,6 +193,8 @@ class FineTune:
             print(f"Starting Epoch {epoch} | LR: {self.optimizer.param_groups[0]['lr']:.2e}")
             
         self.train_data.sampler.set_epoch(epoch)
+
+
         for it, (source, targets) in enumerate(self.train_data):
             
             start_time = time.time()
@@ -190,8 +209,14 @@ class FineTune:
             
             loss_values = criterion(logits, targets_onehot.to(logits.device))
             loss = loss_values.mean()
-            loss.backward()
+
+            # loss = F.cross_entropy(logits, targets)
+            loss.backward()            
+            ema = torch.optim.swa_utils.AveragedModel(self.model)
             self.optimizer.step()
+            ema.update_parameters(self.model)
+
+            self.scheduler.step()
             
             batch_time = time.time() - start_time
             # — W&B: log training loss & step
@@ -284,9 +309,7 @@ class FineTune:
             
         for epoch in range(max_epochs):
             
-            self._run_epoch(epoch)
-            self.scheduler.step()
-            
+            self._run_epoch(epoch)     
             
             metrics = self._evaluate(self.model, self.val_data, self.gpu_id)
             if self.gpu_id == 0 and metrics:
@@ -335,7 +358,7 @@ class FineTune:
       
             
 
-def load_train_objs(num_labels=15, lr=1e-4, weight_decay=1e-4, device=None):
+def load_train_objs(num_labels=15, lr=1e-5, weight_decay=4e-3, device=None, batch_size=48):
     
     # loads dataset
     ds = load_dataset("Bingsu/Human_Action_Recognition")  # load your dataset
@@ -345,58 +368,55 @@ def load_train_objs(num_labels=15, lr=1e-4, weight_decay=1e-4, device=None):
         num_labels=15)    
     
     
-    # loads optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    
-    eta_min     = lr * 0.01
-    
-    
-    eta_min  = lr * 0.01   # floor at 1% of initial lr
-    total_epochs = 15
-    
-    warmup_epochs = 2   # ~20% of 10
-    cosine_epochs = 10 - warmup_epochs
-    
-    # scheduler_multistep = MultiStepLR(
-    #     optimizer,
-    #     milestones=[4, 7],  # drop at ~40% and ~70% through training
-    #     gamma=0.1
-    # )
+    base_lr       = lr           
+    weight_decay  = weight_decay
+    eta_min       = base_lr * 0.001 # floor LR = 1 % of base
+    total_epochs  = 28
 
-    # scheduler_plateau = ReduceLROnPlateau(
-    #     optimizer,
-    #     mode='max',          # watching val mAP
-    #     factor=0.5,          # halve the LR
-    #     patience=2,          # wait 2 epochs with no val mAP gain
-    #     threshold=1e-3    )
 
-    # scheduler_warmup = SequentialLR(
-    #     optimizer,
-    #     schedulers=[
-    #     LinearLR(optimizer, start_factor=1e-6/lr, end_factor=1.0, total_iters=warmup_epochs),
-    #     CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=eta_min)
-    #     ],
-    #     milestones=[warmup_epochs]
-    # )
-    
-    # loads scheduler
-    scheduler_restarts = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=5,           # first cycle = 5 epochs
-        T_mult=1,        # keep cycle length constant at 5
-        eta_min=eta_min
+    cycle_epochs    = 4            
+    # (20 epochs total → we’ll complete 3 cycles: epochs 2-7, 8-13, 14-19)
+
+    steps_per_epoch = math.ceil(len(ds['train']) * 0.8 / batch_size)  # ≈ training batches
+    warmup_iters   = int(0.2 * steps_per_epoch)
+    cycle_iters    = 4 * steps_per_epoch
+
+    head, base = [], []
+    for n, p in model.named_parameters():
+        (head if "classifier" in n else base).append(p)
+    optimizer = optim.AdamW(
+        [
+            {"params": base, "lr": 0.5 * base_lr},
+            {"params": head, "lr": 1.5 * base_lr},
+        ],
+        weight_decay  = weight_decay
     )
-    
-    # scheduler = CosineAnnealingLR(
-    #     optimizer,
-    #     T_max=10,        # one full cosine cycle over your 10 epochs
-    #     eta_min=eta_min
-    # )
-    
-    # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+
+    # 1) linear warm-up
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor = 1e-2,       # start at 1 % of base_lr
+        end_factor   = 1.0,        # reach base_lr
+        total_iters  = warmup_iters
+    )
+
+    # 2) cosine-annealing warm restarts
+    cosine_scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0     = cycle_iters,    # first cycle = 6 epochs
+        T_mult  = 1,               # keep every cycle length the same
+        eta_min = base_lr * 1e-4
+    )
+
+    # 3) chain them together
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers = [warmup_scheduler, cosine_scheduler],
+        milestones = [warmup_iters]
+    )
 
     
-    return ds, model, optimizer, scheduler_restarts
+    return ds, model, optimizer, scheduler
 
 
 
@@ -425,12 +445,15 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
         num_labels=15,
         lr=learning_rate,
         weight_decay=weight_decay,
-        device=device
+        device=device,
+        batch_size=batch_size
     )
     
     for n, p in model.named_parameters():
         if "text_model" in n:      # freeze text tower
             p.requires_grad_(False)
+    
+    ## delete text encoder from the model (?)
     
     ds_train = dataset["train"]
     # Create train/val split since official test labels are all zero
@@ -457,8 +480,8 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
         run_name = f"HAR-{datetime.now():%Y%m%d-%H%M%S}"
         wandb.init(
             project="HAR",      # or whatever slug you see in your URL
-            group="lr_finetuning", 
-            tags=["lr=1e-5", "wd=3e-4"],
+            group="plateau_fix", 
+            tags=["lr=1.2e-5", "wd=4e-3"],
             config={                            # snap in your hyperparams
                 "lr":       lr,
                 "weight_decay": weight_decay,

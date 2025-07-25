@@ -1,0 +1,16 @@
+
+local_rank: ${env:LOCAL_RANK, 0}      # read from LOCAL_RANK, fall back to 0
+world_size: ${env:WORLD_SIZE, 1}      # read from WORLD_SIZE, fall back to 1
+
+master:
+  addr: ${env:MASTER_ADDR, localhost}  # read from MASTER_ADDR, fall back to localhost
+  port: ${env:MASTER_PORT, 12356}      # read from MASTER_PORT, fall back to 12356
+
+
+# metadata
+exp_group: "baseline"        # e.g. group all cycles of the same ablation
+exp_name:  "run1"            # unique identifier for this particular run
+exp_desc:  "cosine-scheduler + warmup"  # free-form notes about this run
+
+
+model: CLIP-ViT-B   # picks configs/model/CLIP-ViT-B.yaml by default
