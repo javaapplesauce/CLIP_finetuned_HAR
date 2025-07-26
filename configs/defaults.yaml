@@ -14,3 +14,42 @@ exp_desc:  "cosine-scheduler + warmup"  # free-form notes about this run
 
 
 model: CLIP-ViT-B   # picks configs/model/CLIP-ViT-B.yaml by default
+  num_classes: 15
+
+data:
+  dataset: HAR
+  batch_size: 72
+  # min_samples: ...
+  num_workers: 16
+  # prefetch:
+  validation: False 
+
+  test_size: 0.2
+  seed: 42
+  shuffle: True
+  
+  ### RandomResizedCrop
+  transform:
+    size: 224                            
+    scale: [0.9, 1.0]                    
+    interpolation: BICUBIC               
+    to_rgb: true                         
+    normalize:
+      mean: [0.48145466, 0.4578275, 0.40821073]
+      std:  [0.26862954, 0.26130258, 0.27577711]
+
+loss:
+  name: 'Sign'
+
+optim:
+  base_lr: 1.e-5
+  # slow_lr_backbone: False
+  weight_decay: 4.e-3
+
+
+defaults:
+  - paths: local
+  - scheduler: CosineAnnealingWarmRestarts
+  - _self_
+
+use_ema: true

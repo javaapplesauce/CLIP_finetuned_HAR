@@ -1,0 +1,4 @@
+# configs/model/CLIP-ViT-L.yaml
+# @package _group_
+backbone: CLIP-ViT-L
+embed_dim: 768

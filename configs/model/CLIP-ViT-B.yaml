@@ -1,0 +1,5 @@
+# configs/model/CLIP-ViT-B.yaml
+# @package _group_
+backbone: CLIP-ViT-B
+# any other CLIP-B-specific params, e.g.:
+embed_dim: 512
