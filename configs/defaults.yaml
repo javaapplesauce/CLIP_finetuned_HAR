@@ -1,55 +1,66 @@
+# configs/defaults.yaml
 
-local_rank: ${env:LOCAL_RANK, 0}      # read from LOCAL_RANK, fall back to 0
-world_size: ${env:WORLD_SIZE, 1}      # read from WORLD_SIZE, fall back to 1
+version_base: 1
 
+# === Hydra config groups to compose ===
+defaults:
+  - scheduler: CosineAnnealingWarmRestarts
+  - _self_
+
+# === DDP setup from environment ===
+# local_rank: ${oc.env:LOCAL_RANK}
+# world_size: ${oc.env:WORLD_SIZE}
 master:
-  addr: ${env:MASTER_ADDR, localhost}  # read from MASTER_ADDR, fall back to localhost
-  port: ${env:MASTER_PORT, 12356}      # read from MASTER_PORT, fall back to 12356
+  addr:     ${env:MASTER_ADDR, localhost}
+  port:     ${env:MASTER_PORT, 12356}
 
+# === Experiment metadata ===
+exp_group:  baseline
+exp_name:   run1
+exp_desc:   cosine-scheduler + warmup
 
-# metadata
-exp_group: "baseline"        # e.g. group all cycles of the same ablation
-exp_name:  "run1"            # unique identifier for this particular run
-exp_desc:  "cosine-scheduler + warmup"  # free-form notes about this run
+# === Model choice (will load configs/model/CLIP-ViT-B.yaml) ===
+model:        CLIP-ViT-B
+num_classes:  15
 
-
-model: CLIP-ViT-B   # picks configs/model/CLIP-ViT-B.yaml by default
-  num_classes: 15
-
+# === Data settings ===
 data:
-  dataset: HAR
-  batch_size: 72
-  # min_samples: ...
-  num_workers: 16
-  # prefetch:
-  validation: False 
-
-  test_size: 0.2
-  seed: 42
-  shuffle: True
-  
-  ### RandomResizedCrop
+  dataset:      HAR
+  batch_size:   72
+  num_workers:  16
+  validation:   false
+  test_size:    0.2
+  seed:         42
+  shuffle:      true
   transform:
-    size: 224                            
-    scale: [0.9, 1.0]                    
-    interpolation: BICUBIC               
-    to_rgb: true                         
+    size:          224
+    scale:         [0.9, 1.0]
+    interpolation: BICUBIC
+    to_rgb:        true
     normalize:
       mean: [0.48145466, 0.4578275, 0.40821073]
       std:  [0.26862954, 0.26130258, 0.27577711]
 
+# === Loss & Optimizer ===
 loss:
-  name: 'Sign'
+  name: Sign
 
 optim:
-  base_lr: 1.e-5
-  # slow_lr_backbone: False
-  weight_decay: 4.e-3
+  base_lr:      1e-5
+  weight_decay: 4e-3
 
-
-defaults:
-  - paths: local
-  - scheduler: CosineAnnealingWarmRestarts
-  - _self_
-
+# === EMA switch ===
 use_ema: true
+
+
+# === Training loop settings ===
+# Number of total epochs to run
+epochs:     10
+
+# Save a checkpoint every N epochs (and on best)
+save_every: 5
+
+train:
+  print_freq: 10  # log every 10 iters (adjust as you like)
+
+  # how often to write a checkpoint (in epochs)

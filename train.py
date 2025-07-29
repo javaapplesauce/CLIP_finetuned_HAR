@@ -40,12 +40,12 @@ import numpy as np
 ### initialize wandb
 def wandb_init(cfg: DictConfig):
     wandb.init(
-        project='HAR',
+        project='HAR-ver2',
         group=cfg.exp_group,
         name=cfg.exp_name,
         notes=cfg.exp_desc,
         save_code=True,
-        config=OmegaConf.to_container(cfg, resolve=True)
+        config=OmegaConf.to_container(cfg, resolve=False)
     )
     OmegaConf.save(config=cfg, f=os.path.join(wandb.run.dir, 'conf.yaml'))
 
@@ -144,7 +144,7 @@ def _evaluate(model, loader, device):
             all_labels.extend(labels.cpu().tolist())
             all_probs.extend(probs.cpu().tolist())
     
-    if dist.is_initalized():
+    if dist.is_initialized():
         all_preds = gather_list(all_preds)
         all_labels = gather_list(all_labels)
         all_probs = gather_list(all_probs)
@@ -173,6 +173,19 @@ def _evaluate(model, loader, device):
     mAP = np.mean(APs) * 100
     return {"acc": acc, "prec": prec, "rec": rec, "f1": f1, "mAP": mAP}
 
+### metrics
+class Metric:
+    def __init__(self):
+        self.cnt = 0
+        self.val = 0
+        self.total_val = 0
+        self.mean = 0
+
+    def add_val(self, val):
+        self.cnt += 1
+        self.total_val += val
+        self.val = val
+        self.mean = self.total_val / self.cnt
 
 ### training loop
 class Trainer:
@@ -191,23 +204,29 @@ class Trainer:
         self.train_loader = train_data  # Store for loop
         self.val_loader = val_data
         self.test_loader = test_data
-        self.cfg.data.n_iters = len(train_loader)
+        self.train_sampler = self.train_loader.sampler
 
-        model = build_model(self.cfg).to(self.local_rank)
-        self.model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = build_model(self.cfg).to(self.device)
+        self.model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
         
         self.criterion = build_criterion(cfg, self.train_loader)
         self.optimizer = build_optimizer(cfg, self.model)
         self.scheduler = build_scheduler(cfg, self.optimizer)
 
+        self.id_str = '[G %d/%d, L %d/%d]' % (self.global_rank, self.world_size, self.local_rank, self.local_gpus)
+        self.save_every = cfg.save_every
         self.best_acc = 0.0
+
+    def log(self, message, master_only=True):
+        if (master_only and self.global_master) or (not master_only):
+            print(self.id_str + ': ' + str(message))
 
     def train(self):
         if self.global_master:
             wandb_init(self.cfg)
 
         
-        ema = torch.optim.swa_utils.AveragedModel(model) if self.cfg.get("use_ema", False) else None
+        ema = torch.optim.swa_utils.AveragedModel(self.model) if self.cfg.get("use_ema", False) else None
 
         for epoch in range(self.cfg.epochs):
             self.train_sampler.set_epoch(epoch)
@@ -215,7 +234,7 @@ class Trainer:
             self.model.train()
 
             if self.global_master:
-                wandb.log({'lr': optimizer.param_groups[0]['lr']}, step=epoch)
+                wandb.log({'lr': self.optimizer.param_groups[0]['lr']}, step=epoch)
 
             for it, (source, targets) in enumerate(self.train_loader):
                 start_time = time.time()
@@ -227,7 +246,7 @@ class Trainer:
 
                 output = self.model(source)
                 logits  = output.logits
-                targets_onehot = torch.nn.F.one_hot(
+                targets_onehot = F.one_hot(
                     targets, num_classes=15).float().to(self.device)
                 
                 loss_values = self.criterion(logits, targets_onehot.to(logits.device))
@@ -236,10 +255,10 @@ class Trainer:
                 self.optimizer.step()
 
                 if ema:
-                    ema.update_parameters(model)
+                    ema.update_parameters(self.model)
 
                 if self.cfg.scheduler.name == 'CosineAnnealingWarmRestarts':
-                    self.scheduler.step(epoch + it / self.cfg.data.n_iters)
+                    self.scheduler.step(epoch + it / len(self.train_loader))
                 else:
                     self.scheduler.step()  
               
@@ -250,7 +269,7 @@ class Trainer:
                 if self.global_master and it % self.cfg.train.print_freq == 0:
                     self.log(
                         f"Epoch: {epoch}/{self.cfg.epochs}, "
-                        f"Iter: {it}/{len(train_data)}, "
+                        f"Iter: {it}/{len(self.train_loader)}, "
                         f"Loss: {loss.item():.4f} ({metric.mean:.4f}), "
                         f"Time: {batch_time:.2f}s"
                     )
@@ -260,10 +279,10 @@ class Trainer:
                         "train/loss_avg": metric.mean,
                         "train/batch_time": batch_time,
                         "train/epoch": epoch,
-                    }, step=epoch * self.cfg.data.n_iters + it)
+                    }, step=epoch * len(self.train_loader) + it)
             
             
-            metrics = self._evaluate(self.model, self.val_loader, self.device)
+            metrics = _evaluate(self.model, self.val_loader, self.device)
             if self.global_master and metrics:
                 print(
                     f"Val Accuracy: {metrics['acc']:.2f}% | "
@@ -288,39 +307,46 @@ class Trainer:
                     self.best_acc = metrics['acc']
                     self._save_checkpoint(epoch, best=True)
 
+    def _save_checkpoint(self, epoch, best: bool = False):
+        
+        ckp = {
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict(),
+            "epoch": epoch,
+            "best_acc": self.best_acc,
+        }
+        
+        path = "best.pt" if best else f"checkpoint_epoch{epoch}.pt"
+        torch.save(ckp, path)
 
 
 
 
-
-@hydra.main(config_path='configs', config_name='defaults')
+@hydra.main(version_base=None, config_path="configs", config_name="defaults")
 def main(cfg: DictConfig):
     pretty.install()
-    OmegaConf.resolve(cfg)
+    # OmegaConf.resolve(cfg)
 
-    os.environ["MASTER_ADDR"] = cfg.master.addr
-    os.environ["MASTER_PORT"] = str(cfg.master.port)
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
 
     # 1) initialize DDP from torchrun's env vars
     dist.init_process_group(
         backend="nccl",
-        init_method="env://",            # reads MASTER_ADDR & MASTER_PORT
-        rank=cfg.local_rank,
-        world_size=cfg.world_size,
+        init_method="env://",
         timeout=timedelta(minutes=10),
     )
 
     # 2) discover ranks
-    world_size = dist.get_world_size()
-    rank       = dist.get_rank()
-    local_rank = cfg.local_rank
-
-    # 3) bind to the correct GPU
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", cfg.local_rank)
+    world_size = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ["RANK"])
     
-    trainer = Trainer(cfg, cfg.local_rank)
+    trainer = Trainer(cfg, local_rank)
     trainer.train()
+    dist.destroy_process_group()
+
 
 
 if __name__ == "__main__":

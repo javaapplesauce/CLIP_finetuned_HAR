@@ -4,5 +4,6 @@
 
 # ignore Weights & Biases logs
 wandb/
+outputs/
 
 *.sh

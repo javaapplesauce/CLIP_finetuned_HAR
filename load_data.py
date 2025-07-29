@@ -28,24 +28,44 @@ class HFDataset(Dataset):
         img_tensor = self.transform(img)
         label = item["labels"]  # integer label 0-14
         return img_tensor, label
+
+def get_transform(cfg: DictConfig) -> transforms.Compose:
+    t = cfg.data.transform
+    ops = [
+        transforms.RandomResizedCrop(
+            t.size,
+            scale=(t.scale[0], t.scale[1]),
+            interpolation=getattr(InterpolationMode, t.interpolation)
+        )
+    ]
+    if t.to_rgb:
+        ops.append(transforms.Lambda(lambda img: img.convert("RGB")))
+    ops.extend([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=tuple(t.normalize.mean),
+            std=tuple(t.normalize.std)
+        )
+    ])
+    return transforms.Compose(ops)
     
 def prepare_dataloader(dataset: Dataset, 
                         batch_size: int,
                         num_workers: int, 
                         shuffle: bool = False) -> DataLoader:
     sampler = DistributedSampler(dataset, shuffle=shuffle)
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-        )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
         
 def load_data(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoader]:
 
     # loads dataset
-    ds = load_dataset("Bingsu/Human_Action_Recognition")  # load your dataset
+    dataset = load_dataset("Bingsu/Human_Action_Recognition")  # load your dataset
 
     ds_train = dataset["train"]
     # Create train/val split since official test labels are all zero
@@ -58,10 +78,12 @@ def load_data(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoader]:
     ## split train_ds --> train and val
     test_ds   = split["test"]
 
+    transform = get_transform(cfg)
+
     # Wrap in our PyTorch Dataset
-    train_dataset = HFDataset(train_ds, HFDataset.transform())
-    val_dataset   = HFDataset(val_ds,   HFDataset.transform())
-    test_dataset   = HFDataset(test_ds,   HFDataset.transform())
+    train_dataset = HFDataset(train_ds, transform)
+    val_dataset   = HFDataset(val_ds,  transform)
+    test_dataset   = HFDataset(test_ds,   transform)
 
     # loads test, validation, and training dataset
     train_data = prepare_dataloader(train_dataset, batch_size=cfg.data.batch_size, num_workers=cfg.data.num_workers)
