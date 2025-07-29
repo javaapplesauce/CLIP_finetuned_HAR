@@ -1,43 +1,37 @@
 import os
+import sys
+import time
+import random
+import math
+import psutil
+from datetime import timedelta
+from collections import Counter
 
-# Torch imports
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.optim.lr_scheduler as lr_scheduler 
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from transformers import AutoModelForImageClassification
-import torch.distributed as dist
-from torchvision.transforms import InterpolationMode
-from PIL import Image
-
-# Multiprocess imports
-import torch.multiprocessing as mp
-from torch.utils.data.distributed import DistributedSampler
+import torch.optim.lr_scheduler as lr_scheduler
+import torch.distributed as dist  # single import for DDP
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
-# Dataset imports
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+from transformers import AutoModelForImageClassification
 from datasets import load_dataset, DownloadConfig
-from collections import Counter
+
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from rich import pretty
-from load_data import load_data
-
-# Metrics imports
-from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score
-import numpy as np
-import random
 import wandb
-import time
-import psutil
-from datetime import datetime, timedelta
-import sys
-import math
-import pandas
+
+from load_data import load_data
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score, average_precision_score
+)
+import numpy as np
 
 
 
@@ -81,30 +75,30 @@ class SignLoss(nn.Module):
 def build_criterion(cfg, train_loader):
     if cfg.loss.name == 'WBCE':
         pos_weights = train_loader.dataset.get_pos_weights()
-        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weights).cuda())
+        return nn.BCEWithLogitsLoss(pos_weight=torch.tensor((pos_weights), device=train_loader.dataset.device))
     elif cfg.loss.name == 'Sign' or cfg.loss.name == 'SignLoss':
-        criterion = SignLoss()
+        return SignLoss()
     else:
-        raise ValueError
-    
-    return criterion
+        raise ValueError(f"Unknown loss: {cfg.loss.name}")
 
 ### build the optimizer
 def build_optimizer(cfg, model):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.optim.base_lr, weight_decay=cfg.optim.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=cfg.optim.base_lr, 
+        weight_decay=cfg.optim.weight_decay)
+    return optimizer
 
 ### build the scheduler
 def build_scheduler(cfg, optimizer):
     if cfg.scheduler.name == 'CosineAnnealingWarmRestarts':
-            scheduler = lr_scheduler.CosineAnnealingWarmRestarts(
+            return lr_scheduler.CosineAnnealingWarmRestarts(
                 optimizer,
                 T_0=cfg.scheduler.T_0,
                 T_mult=cfg.scheduler.T_mult
             )
     else:
-        raise NotImplemented()
-
-    return scheduler
+        raise NotImplemented(f"Scheduler {cfg.scheduler.name} not implemented")
 
 ### data loading --> load_data.py
 
@@ -115,8 +109,8 @@ def gather_list(data_list):
     Returns a flat list on all ranks.
     """
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    gathered = [None] * world_size
     if world_size > 1:
+        gathered = [None] * world_size
         dist.all_gather_object(gathered, data_list)
         # flatten
         flat = []
@@ -138,36 +132,30 @@ def _evaluate(model, loader, device):
 
     with torch.no_grad():
         for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
+            images, labels = images.to(device), labels.to(device)
             
             outputs = model(images)
             logits = outputs.logits if hasattr(outputs, "logits") else outputs
             
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(outputs.logits, dim=1)
             preds = torch.argmax(probs, dim=1)
             
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
             all_probs.extend(probs.cpu().tolist())
-            
-            
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    if world_size > 1:
+    
+    if dist.is_initalized():
         all_preds = gather_list(all_preds)
         all_labels = gather_list(all_labels)
         all_probs = gather_list(all_probs)
-        rank_id = dist.get_rank()
-    else:
-        rank_id = 0
-    if rank_id != 0:
-        return None
+        if dist.get_rank() != 0:
+            return None
 
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     
     total = len(all_labels)
-    correct = (all_preds == all_labels).sum()
+    correct = ( all_preds == all_labels).sum()
     acc = 100.0 * correct / total
     prec = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
     rec  = recall_score(all_labels, all_preds, average='macro', zero_division=0) * 100
@@ -191,67 +179,69 @@ class Trainer:
 
     def __init__(self, cfg, local_rank) -> None:
         self.cfg = cfg
+        self.local_rank = local_rank
         self.global_rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self.local_rank = local_rank
         self.local_gpus = torch.cuda.device_count()
+        self.device = torch.device("cuda", local_rank)
 
         self.global_master = self.global_rank == 0
-        self.local_master = self.local_rank == 0
+
+        train_data, val_data, test_data = load_data(cfg)
+        self.train_loader = train_data  # Store for loop
+        self.val_loader = val_data
+        self.test_loader = test_data
+        self.cfg.data.n_iters = len(train_loader)
+
+        model = build_model(self.cfg).to(self.local_rank)
+        self.model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        
+        self.criterion = build_criterion(cfg, self.train_loader)
+        self.optimizer = build_optimizer(cfg, self.model)
+        self.scheduler = build_scheduler(cfg, self.optimizer)
+
+        self.best_acc = 0.0
 
     def train(self):
         if self.global_master:
             wandb_init(self.cfg)
+
         
-        model = build_model(self.cfg).to(self.local_rank)
-        model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
-
-
-
-        train_data, val_data, test_data = load_data.load_data(self.cfg)
-        self.train_data = train_data  # Store for loop
-        self.val_data = val_data
-        self.test_data = test_data
-        self.cfg.data.n_iters = len(train_data)
-
-        criterion = build_criterion(self.cfg, train_loader)
-        optimizer = build_optimizer(self.cfg, model)
-        scheduler = build_scheduler(self.cfg, optimizer)
         ema = torch.optim.swa_utils.AveragedModel(model) if self.cfg.get("use_ema", False) else None
 
         for epoch in range(self.cfg.epochs):
-            val_data.set_epoch(epoch)
+            self.train_sampler.set_epoch(epoch)
             metric = Metric()
-            model.train()
+            self.model.train()
 
             if self.global_master:
                 wandb.log({'lr': optimizer.param_groups[0]['lr']}, step=epoch)
 
-            for it, (source, targets) in enumerate(self.train_data):
+            for it, (source, targets) in enumerate(self.train_loader):
                 start_time = time.time()
                 
-                source = source.to(self.local_rank)
-                targets = targets.to(self.local_rank)
+                source = source.to(self.device)
+                targets = targets.to(self.device)
                 
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
 
-                output = model(source)
+                output = self.model(source)
                 logits  = output.logits
                 targets_onehot = torch.nn.F.one_hot(
-                    targets, num_classes=15).float()
+                    targets, num_classes=15).float().to(self.device)
                 
-                loss_values = criterion(logits, targets_onehot.to(logits.device))
+                loss_values = self.criterion(logits, targets_onehot.to(logits.device))
                 loss = loss_values.mean()
                 loss.backward()            
-                optimizer.step()
+                self.optimizer.step()
 
                 if ema:
                     ema.update_parameters(model)
 
                 if self.cfg.scheduler.name == 'CosineAnnealingWarmRestarts':
-                    scheduler.step(epoch + it / self.cfg.data.n_iters)
+                    self.scheduler.step(epoch + it / self.cfg.data.n_iters)
                 else:
-                    scheduler.step()  
+                    self.scheduler.step()  
               
                 metric.add_val(loss.item())
 
@@ -273,8 +263,8 @@ class Trainer:
                     }, step=epoch * self.cfg.data.n_iters + it)
             
             
-            metrics = self._evaluate(self.model, self.val_data, self.gpu_id)
-            if self.gpu_id == 0 and metrics:
+            metrics = self._evaluate(self.model, self.val_loader, self.device)
+            if self.global_master and metrics:
                 print(
                     f"Val Accuracy: {metrics['acc']:.2f}% | "
                     f"Precision: {metrics['prec']:.2f}% | "
@@ -331,3 +321,7 @@ def main(cfg: DictConfig):
     
     trainer = Trainer(cfg, cfg.local_rank)
     trainer.train()
+
+
+if __name__ == "__main__":
+    main()
