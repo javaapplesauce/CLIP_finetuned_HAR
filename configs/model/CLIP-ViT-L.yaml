@@ -2,3 +2,4 @@
 # @package _group_
 backbone: CLIP-ViT-L
 embed_dim: 768
+alpha: 10.0

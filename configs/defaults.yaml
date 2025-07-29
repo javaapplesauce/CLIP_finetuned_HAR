@@ -5,6 +5,7 @@ version_base: 1
 # === Hydra config groups to compose ===
 defaults:
   - scheduler: CosineAnnealingWarmRestarts
+  - model: CLIP-ViT-B
   - _self_
 
 # === DDP setup from environment ===
@@ -20,7 +21,6 @@ exp_name:   run1
 exp_desc:   cosine-scheduler + warmup
 
 # === Model choice (will load configs/model/CLIP-ViT-B.yaml) ===
-model:        CLIP-ViT-B
 num_classes:  15
 
 # === Data settings ===
@@ -52,6 +52,8 @@ optim:
 # === EMA switch ===
 use_ema: true
 
+# === joint embedding switch ===
+joint_embed: false
 
 # === Training loop settings ===
 # Number of total epochs to run

@@ -19,7 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from transformers import AutoModelForImageClassification
+from transformers import AutoModelForImageClassification, CLIPTextModel, CLIPTokenizer, CLIPModel
 from datasets import load_dataset, DownloadConfig
 
 import hydra
@@ -52,9 +52,57 @@ def wandb_init(cfg: DictConfig):
 
 ### build the model (default ViT-32)
 def build_model(cfg: DictConfig):
-    return AutoModelForImageClassification.from_pretrained(
-        "openai/clip-vit-base-patch32",
-        num_labels=15)
+    
+    if cfg.joint_embed == True:
+
+        tok = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        model = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
+        model.eval()
+        model = model.cuda()
+
+        class_names = ["calling", "clapping", "cycling", "dancing", "drinking", 
+                        "eating", "fighting", "hugging", "laughing", "listening_to_music", 
+                        "running", "sitting", "sleeping", "texting", "using_laptop"]
+        texts = [f"a person is {c}" for c in class_names]
+        
+        inputs = tok(texts, return_tensors="pt", padding=True).to("cuda")
+
+        with torch.no_grad():
+            out = model(**inputs).last_hidden_state  # (B, T, D)
+            # use the [EOS] token
+            eos_ix = (inputs.attention_mask.sum(dim=1) - 1).unsqueeze(-1)
+            embeds = out[torch.arange(len(texts)), eos_ix.squeeze()]  # (B, D)
+
+        embeds = embeds / embeds.norm(dim=1, keepdim=True)
+        torch.save(embeds.cpu(), "lan_emb.pt")
+
+        clip = CLIPModel.from_pretrained(
+            cfg.model.backbone,
+            num_labels=15,   # make sure this matches your number of classes
+        )
+        C    = 15
+        d    = clip.config.projection_dim   # 512
+
+        head = nn.Linear(d, C, bias=True)
+
+        lan_emb = torch.load("lan_emb.pt")  # shape (C, d)
+
+        assert lan_emb.shape == (15, d), "Check your shapes!"
+
+        head.weight.data.copy_(lan_emb)
+        head.bias.data.zero_()
+
+        clip.classifier = head
+        clip.logit_scale = torch.nn.Parameter(torch.ones([]) * cfg.model.alpha)  # if you want learnable
+        return clip
+
+
+    
+    elif cfg.joint_embed == False:
+        return AutoModelForImageClassification.from_pretrained(
+            "openai/clip-vit-base-patch32",
+            num_labels=15)
+
 
 
 ### build the criterion
@@ -120,12 +168,12 @@ def gather_list(data_list):
     else:
         return data_list
 
-def _evaluate(model, loader, device):
+def _evaluate(cfg, model, loader, device):
     """
     Evaluates the model on validation set. Returns dict of metrics.
     Metrics: accuracy, precision, recall, f1, mAP
     """
-    
+    cfg = cfg
     model.eval()
     all_preds, all_labels, all_probs = [], [], []
 
@@ -134,10 +182,18 @@ def _evaluate(model, loader, device):
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
             
-            outputs = model(images)
-            logits = outputs.logits if hasattr(outputs, "logits") else outputs
-            
-            probs = torch.softmax(outputs.logits, dim=1)
+
+            # unwrap DDP
+            real_model = model.module if isinstance(model, DDP) else model
+
+            if cfg.joint_embed:
+                feats  = real_model.get_image_features(pixel_values=images)
+                logits = real_model.classifier(real_model.logit_scale.exp() * feats)
+                probs  = torch.softmax(logits, dim=1)
+            else:
+                outputs = real_model(pixel_values=images)
+                probs   = torch.softmax(outputs.logits, dim=1)
+                
             preds = torch.argmax(probs, dim=1)
             
             all_preds.extend(preds.cpu().tolist())
@@ -239,13 +295,22 @@ class Trainer:
             for it, (source, targets) in enumerate(self.train_loader):
                 start_time = time.time()
                 
-                source = source.to(self.device)
+                images = source.to(self.device)
                 targets = targets.to(self.device)
                 
                 self.optimizer.zero_grad()
 
-                output = self.model(source)
-                logits  = output.logits
+                model = self.model.module
+                if self.cfg.joint_embed:
+                    feats  = model.get_image_features(pixel_values=images)              # (B, D)
+                    logits = model.classifier(model.logit_scale.exp() * feats)
+                else:
+                    # standard classification model
+                    outputs = model(pixel_values=images)
+                    logits  = outputs.logits
+
+                self.optimizer.zero_grad()
+
                 targets_onehot = F.one_hot(
                     targets, num_classes=15).float().to(self.device)
                 
@@ -282,7 +347,7 @@ class Trainer:
                     }, step=epoch * len(self.train_loader) + it)
             
             
-            metrics = _evaluate(self.model, self.val_loader, self.device)
+            metrics = _evaluate(self.cfg, self.model, self.val_loader, self.device)
             if self.global_master and metrics:
                 print(
                     f"Val Accuracy: {metrics['acc']:.2f}% | "
