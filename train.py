@@ -108,6 +108,83 @@ def build_scheduler(cfg, optimizer):
 
 ### data loading --> load_data.py
 
+### validation
+def gather_list(data_list):
+    """
+    Helper to gather a Python list from all processes.
+    Returns a flat list on all ranks.
+    """
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    gathered = [None] * world_size
+    if world_size > 1:
+        dist.all_gather_object(gathered, data_list)
+        # flatten
+        flat = []
+        for part in gathered:
+            flat.extend(part)
+        return flat
+    else:
+        return data_list
+
+def _evaluate(model, loader, device):
+    """
+    Evaluates the model on validation set. Returns dict of metrics.
+    Metrics: accuracy, precision, recall, f1, mAP
+    """
+    
+    model.eval()
+    all_preds, all_labels, all_probs = [], [], []
+
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(images)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs
+            
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
+            
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+            all_probs.extend(probs.cpu().tolist())
+            
+            
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if world_size > 1:
+        all_preds = gather_list(all_preds)
+        all_labels = gather_list(all_labels)
+        all_probs = gather_list(all_probs)
+        rank_id = dist.get_rank()
+    else:
+        rank_id = 0
+    if rank_id != 0:
+        return None
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    total = len(all_labels)
+    correct = (all_preds == all_labels).sum()
+    acc = 100.0 * correct / total
+    prec = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
+    rec  = recall_score(all_labels, all_preds, average='macro', zero_division=0) * 100
+    f1   = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
+
+    num_classes = len(np.unique(all_labels))
+    APs = []
+    labels_oneshot = np.zeros((total, num_classes), dtype=int)
+    labels_oneshot[np.arange(total), all_labels] = 1
+    for c in range(num_classes):
+        ap_c = average_precision_score(labels_oneshot[:, c], np.array(all_probs)[:, c])
+        if np.isnan(ap_c):
+            ap_c = 0.0
+        APs.append(ap_c)
+    mAP = np.mean(APs) * 100
+    return {"acc": acc, "prec": prec, "rec": rec, "f1": f1, "mAP": mAP}
+
 
 ### training loop
 class Trainer:
@@ -194,12 +271,36 @@ class Trainer:
                         "train/batch_time": batch_time,
                         "train/epoch": epoch,
                     }, step=epoch * self.cfg.data.n_iters + it)
-        
+            
+            
+            metrics = self._evaluate(self.model, self.val_data, self.gpu_id)
+            if self.gpu_id == 0 and metrics:
+                print(
+                    f"Val Accuracy: {metrics['acc']:.2f}% | "
+                    f"Precision: {metrics['prec']:.2f}% | "
+                    f"Recall: {metrics['rec']:.2f}% | "
+                    f"F1: {metrics['f1']:.2f}% | "
+                    f"mAP: {metrics['mAP']:.2f}%"
+                )
+                
+                wandb.log({
+                    "val/acc": metrics["acc"],
+                    "val/prec": metrics["prec"],
+                    "val/rec": metrics["rec"],
+                    "val/f1": metrics["f1"],
+                    "val/mAP": metrics["mAP"],
+                })
+                
+                if epoch % self.save_every == 0:
+                    self._save_checkpoint(epoch)
+                    
+                if metrics['acc'] > self.best_acc:
+                    self.best_acc = metrics['acc']
+                    self._save_checkpoint(epoch, best=True)
 
 
 
 
-### validation
 
 
 @hydra.main(config_path='configs', config_name='defaults')
