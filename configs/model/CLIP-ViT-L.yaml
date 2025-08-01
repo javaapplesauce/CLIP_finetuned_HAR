@@ -1,5 +1,5 @@
 # configs/model/CLIP-ViT-L.yaml
 # @package _group_
-backbone: CLIP-ViT-L
+backbone: "openai/clip-vit-large-patch14"
 embed_dim: 768
-alpha: 10.0
+alpha: 65.0

@@ -53,10 +53,10 @@ def wandb_init(cfg: DictConfig):
 ### build the model (default ViT-32)
 def build_model(cfg: DictConfig):
     
-    if cfg.joint_embed == True:
+    if cfg.joint_embed:
 
-        tok = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-        model = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
+        tok = CLIPTokenizer.from_pretrained(cfg.model.backbone)
+        model = CLIPTextModel.from_pretrained(cfg.model.backbone)
         model.eval()
         model = model.cuda()
 
@@ -78,22 +78,18 @@ def build_model(cfg: DictConfig):
 
         clip = CLIPModel.from_pretrained(
             cfg.model.backbone,
-            num_labels=15,   # make sure this matches your number of classes
+            num_labels=15,
         )
-        C    = 15
-        d    = clip.config.projection_dim   # 512
+        C, d = 15, clip.config.projection_dim
 
         head = nn.Linear(d, C, bias=True)
-
         lan_emb = torch.load("lan_emb.pt")  # shape (C, d)
-
-        assert lan_emb.shape == (15, d), "Check your shapes!"
-
         head.weight.data.copy_(lan_emb)
         head.bias.data.zero_()
-
         clip.classifier = head
-        clip.logit_scale = torch.nn.Parameter(torch.ones([]) * cfg.model.alpha)  # if you want learnable
+
+        init_log_scale = math.log(cfg.model.alpha)
+        clip.logit_scale = nn.Parameter(torch.tensor(init_log_scale))
         return clip
 
 
@@ -143,7 +139,8 @@ def build_scheduler(cfg, optimizer):
             return lr_scheduler.CosineAnnealingWarmRestarts(
                 optimizer,
                 T_0=cfg.scheduler.T_0,
-                T_mult=cfg.scheduler.T_mult
+                T_mult=cfg.scheduler.T_mult,
+                eta_min=cfg.scheduler.eta_min
             )
     else:
         raise NotImplemented(f"Scheduler {cfg.scheduler.name} not implemented")
@@ -193,7 +190,7 @@ def _evaluate(cfg, model, loader, device):
             else:
                 outputs = real_model(pixel_values=images)
                 probs   = torch.softmax(outputs.logits, dim=1)
-                
+
             preds = torch.argmax(probs, dim=1)
             
             all_preds.extend(preds.cpu().tolist())
@@ -290,7 +287,7 @@ class Trainer:
             self.model.train()
 
             if self.global_master:
-                wandb.log({'lr': self.optimizer.param_groups[0]['lr']}, step=epoch)
+                wandb.log({'lr': self.optimizer.param_groups[0]['lr']})
 
             for it, (source, targets) in enumerate(self.train_loader):
                 start_time = time.time()
@@ -372,6 +369,25 @@ class Trainer:
                     self.best_acc = metrics['acc']
                     self._save_checkpoint(epoch, best=True)
 
+        metrics = _evaluate(self.cfg, self.model, self.test_loader, self.device)
+        if self.global_master and metrics:
+            print(
+                f"Val Accuracy: {metrics['acc']:.2f}% | "
+                f"Precision: {metrics['prec']:.2f}% | "
+                f"Recall: {metrics['rec']:.2f}% | "
+                f"F1: {metrics['f1']:.2f}% | "
+                f"mAP: {metrics['mAP']:.2f}%"
+            )
+            
+            wandb.log({
+                "test/acc": metrics["acc"],
+                "test/f1": metrics["f1"],
+                "test/mAP": metrics["mAP"],
+            })
+
+        
+
+
     def _save_checkpoint(self, epoch, best: bool = False):
         
         ckp = {
@@ -411,6 +427,8 @@ def main(cfg: DictConfig):
     trainer = Trainer(cfg, local_rank)
     trainer.train()
     dist.destroy_process_group()
+
+    
 
 
 

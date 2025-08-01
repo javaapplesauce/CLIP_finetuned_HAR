@@ -3,4 +3,5 @@
 backbone: "openai/clip-vit-base-patch32"
 # any other CLIP-B-specific params, e.g.:
 embed_dim: 512
-alpha: 10.0
+alpha: 65.0
+

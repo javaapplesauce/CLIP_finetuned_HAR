@@ -16,17 +16,34 @@ master:
   port:     ${env:MASTER_PORT, 12356}
 
 # === Experiment metadata ===
-exp_group:  baseline
-exp_name:   run1
-exp_desc:   cosine-scheduler + warmup
+exp_group:  weight_decay
+exp_name:   run40
+exp_desc:   weight sweep, text_embeds=true, 96 batch
 
-# === Model choice (will load configs/model/CLIP-ViT-B.yaml) ===
-num_classes:  15
+optim:
+  base_lr:      1e-5
+  weight_decay: 6e-2
+
+# === joint embedding switch ===
+joint_embed: true
+
+# === Training loop settings ===
+# Number of total epochs to run
+epochs:     20
+
+# Save a checkpoint every N epochs (and on best)
+save_every: 5
+
+train:
+  print_freq: 10  # log every 10 iters (adjust as you like)
+
+  # how often to write a checkpoint (in epochs)
+
 
 # === Data settings ===
 data:
   dataset:      HAR
-  batch_size:   72
+  batch_size:   96
   num_workers:  16
   validation:   false
   test_size:    0.2
@@ -41,28 +58,12 @@ data:
       mean: [0.48145466, 0.4578275, 0.40821073]
       std:  [0.26862954, 0.26130258, 0.27577711]
 
+# === Model choice (will load configs/model/CLIP-ViT-B.yaml) ===
+num_classes:  15
+
 # === Loss & Optimizer ===
 loss:
   name: Sign
 
-optim:
-  base_lr:      1e-5
-  weight_decay: 4e-3
-
 # === EMA switch ===
 use_ema: true
-
-# === joint embedding switch ===
-joint_embed: false
-
-# === Training loop settings ===
-# Number of total epochs to run
-epochs:     10
-
-# Save a checkpoint every N epochs (and on best)
-save_every: 5
-
-train:
-  print_freq: 10  # log every 10 iters (adjust as you like)
-
-  # how often to write a checkpoint (in epochs)
