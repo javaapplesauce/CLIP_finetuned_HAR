@@ -16,9 +16,9 @@ master:
   port:     ${env:MASTER_PORT, 12356}
 
 # === Experiment metadata ===
-exp_group:  weight_decay
-exp_name:   run40
-exp_desc:   weight sweep, text_embeds=true, 96 batch
+exp_group:  number-workers-experiement
+exp_name:   workers-4
+exp_desc:   zero workers
 
 optim:
   base_lr:      1e-5
@@ -44,7 +44,7 @@ train:
 data:
   dataset:      HAR
   batch_size:   96
-  num_workers:  16
+  num_workers:  0
   validation:   false
   test_size:    0.2
   seed:         42

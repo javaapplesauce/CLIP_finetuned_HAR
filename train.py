@@ -45,7 +45,8 @@ def wandb_init(cfg: DictConfig):
         name=cfg.exp_name,
         notes=cfg.exp_desc,
         save_code=True,
-        config=OmegaConf.to_container(cfg, resolve=False)
+        config=OmegaConf.to_container(cfg, resolve=False),
+        reinit=True
     )
     OmegaConf.save(config=cfg, f=os.path.join(wandb.run.dir, 'conf.yaml'))
 
@@ -428,7 +429,7 @@ def main(cfg: DictConfig):
     trainer.train()
     dist.destroy_process_group()
 
-    
+
 
 
 
