@@ -33,7 +33,7 @@ from sklearn.metrics import (
 )
 import numpy as np
 
-
+from textPrompt_embeddings import init_model
 
 
 
@@ -54,46 +54,14 @@ def wandb_init(cfg: DictConfig):
 ### build the model (default ViT-32)
 def build_model(cfg: DictConfig):
     
-    if cfg.joint_embed:
+    if cfg.joint_embed == True:
 
-        tok = CLIPTokenizer.from_pretrained(cfg.model.backbone)
-        model = CLIPTextModel.from_pretrained(cfg.model.backbone)
-        model.eval()
-        model = model.cuda()
-
+        # creates prototype-templates for later tokenization
         class_names = ["calling", "clapping", "cycling", "dancing", "drinking", 
                         "eating", "fighting", "hugging", "laughing", "listening_to_music", 
                         "running", "sitting", "sleeping", "texting", "using_laptop"]
-        texts = [f"a person is {c}" for c in class_names]
-        
-        inputs = tok(texts, return_tensors="pt", padding=True).to("cuda")
 
-        with torch.no_grad():
-            out = model(**inputs).last_hidden_state  # (B, T, D)
-            # use the [EOS] token
-            eos_ix = (inputs.attention_mask.sum(dim=1) - 1).unsqueeze(-1)
-            embeds = out[torch.arange(len(texts)), eos_ix.squeeze()]  # (B, D)
-
-        embeds = embeds / embeds.norm(dim=1, keepdim=True)
-        torch.save(embeds.cpu(), "lan_emb.pt")
-
-        clip = CLIPModel.from_pretrained(
-            cfg.model.backbone,
-            num_labels=15,
-        )
-        C, d = 15, clip.config.projection_dim
-
-        head = nn.Linear(d, C, bias=True)
-        lan_emb = torch.load("lan_emb.pt")  # shape (C, d)
-        head.weight.data.copy_(lan_emb)
-        head.bias.data.zero_()
-        clip.classifier = head
-
-        init_log_scale = math.log(cfg.model.alpha)
-        clip.logit_scale = nn.Parameter(torch.tensor(init_log_scale))
-        return clip
-
-
+        return init_model(cfg, class_names)
     
     elif cfg.joint_embed == False:
         return AutoModelForImageClassification.from_pretrained(
@@ -184,13 +152,9 @@ def _evaluate(cfg, model, loader, device):
             # unwrap DDP
             real_model = model.module if isinstance(model, DDP) else model
 
-            if cfg.joint_embed:
-                feats  = real_model.get_image_features(pixel_values=images)
-                logits = real_model.classifier(real_model.logit_scale.exp() * feats)
-                probs  = torch.softmax(logits, dim=1)
-            else:
-                outputs = real_model(pixel_values=images)
-                probs   = torch.softmax(outputs.logits, dim=1)
+
+            outputs = real_model(pixel_values=images)
+            probs   = torch.softmax(outputs.logits, dim=1)
 
             preds = torch.argmax(probs, dim=1)
             
@@ -298,14 +262,8 @@ class Trainer:
                 
                 self.optimizer.zero_grad()
 
-                model = self.model.module
-                if self.cfg.joint_embed:
-                    feats  = model.get_image_features(pixel_values=images)              # (B, D)
-                    logits = model.classifier(model.logit_scale.exp() * feats)
-                else:
-                    # standard classification model
-                    outputs = model(pixel_values=images)
-                    logits  = outputs.logits
+                outputs = self.model(pixel_values=images)
+                logits  = outputs.logits
 
                 self.optimizer.zero_grad()
 

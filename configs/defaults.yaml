@@ -16,20 +16,20 @@ master:
   port:     ${env:MASTER_PORT, 12356}
 
 # === Experiment metadata ===
-exp_group:  number-workers-experiement
-exp_name:   workers-4
-exp_desc:   zero workers
+exp_group:  data-augments-tests
+exp_name:   new-da-2
+exp_desc:   
 
 optim:
-  base_lr:      1e-5
-  weight_decay: 6e-2
+  base_lr:      1.6473849365087354e-05
+  weight_decay: 0.00015529
 
 # === joint embedding switch ===
 joint_embed: true
 
 # === Training loop settings ===
 # Number of total epochs to run
-epochs:     20
+epochs:     10
 
 # Save a checkpoint every N epochs (and on best)
 save_every: 5

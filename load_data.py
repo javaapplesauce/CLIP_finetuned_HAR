@@ -48,6 +48,20 @@ def get_transform(cfg: DictConfig) -> transforms.Compose:
         )
     ])
     return transforms.Compose(ops)
+
+def get_transform2(cfg: DictConfig) -> transforms.Compose:
+    return transforms.Compose([
+        transforms.RandomResizedCrop(
+            224, scale=(0.5, 1.0), ratio=(0.75, 1.33),
+            interpolation=InterpolationMode.BICUBIC, antialias=True
+        ),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(0.3, 0.3, 0.3, 0.1),
+        transforms.RandomApply([transforms.GaussianBlur(23, sigma=(0.1, 2.0))], p=0.2),
+        transforms.ToTensor(),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random'),
+        transforms.Normalize((0.5,)*3, (0.5,)*3),
+    ])
     
 def prepare_dataloader(dataset: Dataset, 
                         batch_size: int,

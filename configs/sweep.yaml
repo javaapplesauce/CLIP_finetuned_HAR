@@ -9,14 +9,12 @@ metric:
   goal: maximize
 
 parameters:
-  "optim.base_lr":
-    distribution: log_uniform_values
-    min: !!float 1e-7
-    max: !!float 1e-2
+  
   "optim.weight_decay":
     distribution: log_uniform_values
     min: !!float 1e-6
-    max: !!float 1e-1
+    max: !!float 1e-3
+
 
 command:
   - ${env}                      # keep your environment (CUDA_VISIBLE_DEVICES, etc.)
