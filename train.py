@@ -19,7 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from transformers import AutoModelForImageClassification, CLIPTextModel, CLIPTokenizer, CLIPModel
+from transformers import AutoModelForImageClassification, CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPForImageClassification
 from datasets import load_dataset, DownloadConfig
 
 import hydra
@@ -33,7 +33,7 @@ from sklearn.metrics import (
 )
 import numpy as np
 
-from textPrompt_embeddings import init_model
+from textPrompt_embeddings import CLIPViT
 
 
 
@@ -61,11 +61,11 @@ def build_model(cfg: DictConfig):
                         "eating", "fighting", "hugging", "laughing", "listening_to_music", 
                         "running", "sitting", "sleeping", "texting", "using_laptop"]
 
-        return init_model(cfg, class_names)
+        return CLIPViT(cfg, class_names)
     
     elif cfg.joint_embed == False:
-        return AutoModelForImageClassification.from_pretrained(
-            "openai/clip-vit-base-patch32",
+        return CLIPForImageClassification.from_pretrained(
+            cfg.model.backbone,
             num_labels=15)
 
 
@@ -153,8 +153,8 @@ def _evaluate(cfg, model, loader, device):
             real_model = model.module if isinstance(model, DDP) else model
 
 
-            outputs = real_model(pixel_values=images)
-            probs   = torch.softmax(outputs.logits, dim=1)
+            logits = real_model(pixel_values=images)
+            probs   = torch.softmax(logits, dim=1)
 
             preds = torch.argmax(probs, dim=1)
             
@@ -262,10 +262,7 @@ class Trainer:
                 
                 self.optimizer.zero_grad()
 
-                outputs = self.model(pixel_values=images)
-                logits  = outputs.logits
-
-                self.optimizer.zero_grad()
+                logits  = self.model(pixel_values=images)
 
                 targets_onehot = F.one_hot(
                     targets, num_classes=15).float().to(self.device)

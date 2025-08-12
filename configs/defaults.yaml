@@ -16,8 +16,8 @@ master:
   port:     ${env:MASTER_PORT, 12356}
 
 # === Experiment metadata ===
-exp_group:  data-augments-tests
-exp_name:   new-da-2
+exp_group:  tests
+exp_name:   fixed-classifier
 exp_desc:   
 
 optim:

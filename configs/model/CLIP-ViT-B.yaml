@@ -5,3 +5,8 @@ backbone: "openai/clip-vit-base-patch32"
 embed_dim: 512
 alpha: 50
 
+# equivalent to temperature
+s: 100
+
+# toggle to utilize alternate form of matrix multiplication 
+HvProjection: True
