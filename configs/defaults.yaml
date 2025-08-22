@@ -16,8 +16,8 @@ master:
   port:     ${env:MASTER_PORT, 12356}
 
 # === Experiment metadata ===
-exp_group:  tests
-exp_name:   fixed-classifier
+exp_group:  Aug122025
+exp_name:   baseline
 exp_desc:   
 
 optim:
@@ -29,10 +29,10 @@ joint_embed: true
 
 # === Training loop settings ===
 # Number of total epochs to run
-epochs:     10
+epochs:     5
 
 # Save a checkpoint every N epochs (and on best)
-save_every: 5
+save_every: 2
 
 train:
   print_freq: 10  # log every 10 iters (adjust as you like)

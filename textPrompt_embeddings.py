@@ -4,6 +4,7 @@ from torch import nn
 from omegaconf import DictConfig
 from transformers import AutoModelForImageClassification, CLIPModel, CLIPTokenizer
 import math
+import torch.nn.functional as F
 
 
 
@@ -56,16 +57,20 @@ class CLIPViT(nn.Module):
         self.class_names = class_names
         self.clip = CLIPModel.from_pretrained(cfg.model.backbone)
         self.tok = CLIPTokenizer.from_pretrained(cfg.model.backbone)
-        s = float(cfg.model.s)
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(1/s)))
+        self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0/cfg.model.s)))
         self.HvProjection = cfg.model.HvProjection
         
         # build text weights
         TEMPLATES = [
-            "a person is {}.",
-            "human action: {}.",
-            "someone is {}.",
-            "a photo of a person {}."
+                "a person {}.",
+                "someone is {}.",
+                "a photo of a person {}.",
+                # "human action: {}.",
+                # "a person is {}.",
+                # "a photo of someone {}.",
+                # "a person engaged in {}.",
+                # "an image of a person {}.",
+                
         ]
         texts = [t.format(c.replace("_"," ")) for c in class_names for t in TEMPLATES]
         per   = len(TEMPLATES)
@@ -73,10 +78,9 @@ class CLIPViT(nn.Module):
         with torch.no_grad():
             inputs = self.tok(texts, return_tensors="pt", padding=True, truncation=True)
             text_features  = self.clip.get_text_features(**inputs)                         # (N*per, D=projection_dim)
-            text_features  = text_features / text_features.norm(dim=-1, keepdim=True)
             # average per-class
-            text_features = text_features.view(len(class_names), per, -1).mean(dim=1)  # (N, 512)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            text_features = text_features.reshape(len(class_names), per, -1).mean(dim=1)  # (N, D)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)     # re-normalize
             # text_features --> T_emb @ T_proj
             
         if self.HvProjection:
@@ -84,14 +88,13 @@ class CLIPViT(nn.Module):
             ### goal: [V_proj @ (T_emb @ T_proj)^T)]^T --> [(768, 512) @ ((N,768)@(768,512))^T]^T
             
             # V_proj^T
-            VprojT = self.clip.visual_projection.weight.t().detach() # detach to use as a fixed mapping (build classifier)
+            VprojT = self.clip.visual_projection.weight.t() 
             Wv = (VprojT @ text_features.t()).t()
             
-            Wv = Wv / Wv.norm(dim=-1, keepdim=True) # do i need to normalize here? probably not 
+            # Wv = F.normalize(Wv, dim=-1) # do i need to normalize here? probably not 
 
-            self.classifier = nn.Parameter(Wv)
+            self.classifier = nn.Parameter(Wv, requires_grad=True)
             self.return_hidden = True
-            
         else:
             
             ### goal: (V_cls @ V_proj) @ (T_emb @ T_proj)
@@ -111,15 +114,19 @@ class CLIPViT(nn.Module):
         vis_model = self.clip.vision_model
         outputs = vis_model(pixel_values=pixel_values, output_hidden_states=False)
         pooled = outputs.pooler_output
+        pooled = F.normalize(pooled, dim=-1)
         return pooled
 
     def forward(self, pixel_values):
         if self.return_hidden:
             img = self.encode_image_hidden(pixel_values)            # (B, 768)
-        else:
-            img = self.clip.get_image_features(pixel_values)        # (B, 512)
+            txt = self.classifier / self.classifier.norm(dim=-1, keepdim=True)
+            logits = torch.exp(self.logit_scale) * img @ txt.t()        # (B, ncls)
 
-        img = img / img.norm(dim=-1, keepdim=True)
-        txt = self.classifier / self.classifier.norm(dim=-1, keepdim=True)
-        logits = torch.exp(self.logit_scale) * img @ txt.t()        # (B, ncls)
+        elif (self.return_hidden == False):
+            img = self.clip.get_image_features(pixel_values)        # (B, 512)
+            txt = self.classifier / self.classifier.norm(dim=-1, keepdim=True)
+            logits = torch.exp(self.logit_scale) * img @ txt.t()        # (B, ncls)
+
+        
         return logits    

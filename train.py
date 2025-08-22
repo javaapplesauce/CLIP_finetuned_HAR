@@ -19,7 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from transformers import AutoModelForImageClassification, CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPForImageClassification
+from transformers import AutoModelForImageClassification, CLIPTextModel, CLIPTokenizer, CLIPModel
 from datasets import load_dataset, DownloadConfig
 
 import hydra
@@ -64,7 +64,7 @@ def build_model(cfg: DictConfig):
         return CLIPViT(cfg, class_names)
     
     elif cfg.joint_embed == False:
-        return CLIPForImageClassification.from_pretrained(
+        return CLIPModel.from_pretrained(
             cfg.model.backbone,
             num_labels=15)
 
@@ -321,8 +321,8 @@ class Trainer:
                 if epoch % self.save_every == 0:
                     self._save_checkpoint(epoch)
                     
-                if metrics['acc'] > self.best_acc:
-                    self.best_acc = metrics['acc']
+                if metrics['mAP'] > self.best_acc:
+                    self.best_acc = metrics['mAP']
                     self._save_checkpoint(epoch, best=True)
 
         metrics = _evaluate(self.cfg, self.model, self.test_loader, self.device)
