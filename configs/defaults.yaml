@@ -2,11 +2,11 @@
 
 version_base: 1
 
-# === Hydra config groups to compose ===
-defaults:
-  - scheduler: CosineAnnealingWarmRestarts
-  - model: CLIP-ViT-B
-  - _self_
+# === Training loop settings ===
+epochs:     3
+save_every: 2
+train:
+  print_freq: 10  # log every 10 iters
 
 # === DDP setup from environment ===
 # local_rank: ${oc.env:LOCAL_RANK}
@@ -16,54 +16,43 @@ master:
   port:     ${env:MASTER_PORT, 12356}
 
 # === Experiment metadata ===
+project: HAR-ver2
 exp_group:  Aug122025
 exp_name:   baseline
 exp_desc:   
+save_code: True
 
+
+# === Building model ===
+defaults:
+  - scheduler: CosineAnnealingWarmRestarts
+  - model: CLIP-ViT-B
+  - _self_
+joint_embed: False
+num_classes:  15
+
+# === Loss & Optimizer ===
+loss:
+  name: Sign
 optim:
   base_lr:      1.6473849365087354e-05
   weight_decay: 0.00015529
-
-# === joint embedding switch ===
-joint_embed: true
-
-# === Training loop settings ===
-# Number of total epochs to run
-epochs:     5
-
-# Save a checkpoint every N epochs (and on best)
-save_every: 2
-
-train:
-  print_freq: 10  # log every 10 iters (adjust as you like)
-
-  # how often to write a checkpoint (in epochs)
-
+use_ema: True
 
 # === Data settings ===
 data:
   dataset:      HAR
   batch_size:   96
   num_workers:  0
-  validation:   false
+  validation:   False
   test_size:    0.2
   seed:         42
-  shuffle:      true
+  shuffle:      True
   transform:
     size:          224
     scale:         [0.9, 1.0]
     interpolation: BICUBIC
-    to_rgb:        true
+    to_rgb:        True
     normalize:
       mean: [0.48145466, 0.4578275, 0.40821073]
       std:  [0.26862954, 0.26130258, 0.27577711]
-
-# === Model choice (will load configs/model/CLIP-ViT-B.yaml) ===
-num_classes:  15
-
-# === Loss & Optimizer ===
-loss:
-  name: Sign
-
-# === EMA switch ===
-use_ema: true

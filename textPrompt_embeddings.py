@@ -6,40 +6,6 @@ from transformers import AutoModelForImageClassification, CLIPModel, CLIPTokeniz
 import math
 import torch.nn.functional as F
 
-
-
-# @torch.no_grad()
-# def _build_text_prototypes(backbone: str, class_names: list[str], device: torch.device) -> torch.Tensor:
-    
-#     tok  = CLIPTokenizer.from_pretrained(backbone)
-#     clip = CLIPModel.from_pretrained(backbone)
-    
-#     clip.to(device)
-#     clip.eval()
-
-#     TEMPLATES = [
-#         "a photo of a person {}.",
-#         "a person is {}.",
-#         "human action: {}.",
-#         "someone is {}.",
-#     ]
-#     texts = [t.format(c.replace("_", " ")) for c in class_names for t in TEMPLATES]
-#     per   = len(TEMPLATES)
-
-#     inputs = tok(texts, return_tensors="pt", padding=True, truncation=True).to(device)
-#     feats  = clip.get_text_features(**inputs)                         # (C*per, D=projection_dim)
-#     feats  = feats / (feats.norm(dim=-1, keepdim=True) + 1e-12)
-
-#     C = len(class_names)
-#     W_text = torch.stack([feats[i*per:(i+1)*per].mean(0) for i in range(C)], dim=0)  # (C, D)
-#     W_text = W_text / (W_text.norm(dim=-1, keepdim=True) + 1e-12)                    # L2 norm
-#     return W_text, clip  # keep clip to access visual_projection if needed
-
-
-
-
-
-
 class CLIPViT(nn.Module):
     """
         Inputs:
@@ -50,7 +16,6 @@ class CLIPViT(nn.Module):
             s: equivalent to temperature, from configs    
     """
     
-    
     def __init__(self, cfg, class_names=None, ):
         super().__init__()
         assert class_names is not None
@@ -58,53 +23,42 @@ class CLIPViT(nn.Module):
         self.clip = CLIPModel.from_pretrained(cfg.model.backbone)
         self.tok = CLIPTokenizer.from_pretrained(cfg.model.backbone)
         self.logit_scale = nn.Parameter(torch.log(torch.tensor(1.0/cfg.model.s)))
-        self.HvProjection = cfg.model.HvProjection
-        
+        self.HvProjection = bool(cfg.model.HvProjection)
+
         # build text weights
         TEMPLATES = [
-                "a person {}.",
-                "someone is {}.",
-                "a photo of a person {}.",
-                # "human action: {}.",
+                # "someone {}.",
+                # "someone is {}.",
+                # "a person {}.",
                 # "a person is {}.",
-                # "a photo of someone {}.",
-                # "a person engaged in {}.",
-                # "an image of a person {}.",
+                # "human action: {}.",
+                "an image of a person {}."
                 
         ]
         texts = [t.format(c.replace("_"," ")) for c in class_names for t in TEMPLATES]
         per   = len(TEMPLATES)
+        N = len(class_names)
+        eps   = 1e-12
         
         with torch.no_grad():
+            assert len(texts) == N * per
             inputs = self.tok(texts, return_tensors="pt", padding=True, truncation=True)
             text_features  = self.clip.get_text_features(**inputs)                         # (N*per, D=projection_dim)
             # average per-class
-            text_features = text_features.reshape(len(class_names), per, -1).mean(dim=1)  # (N, D)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)     # re-normalize
+            text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + eps)     # re-normalize
+            text_features = text_features.view(N, per, -1)
             # text_features --> T_emb @ T_proj
-            
-        if self.HvProjection:
-            
-            ### goal: [V_proj @ (T_emb @ T_proj)^T)]^T --> [(768, 512) @ ((N,768)@(768,512))^T]^T
-            
-            # V_proj^T
-            VprojT = self.clip.visual_projection.weight.t() 
-            Wv = (VprojT @ text_features.t()).t()
-            
-            # Wv = F.normalize(Wv, dim=-1) # do i need to normalize here? probably not 
 
-            self.classifier = nn.Parameter(Wv, requires_grad=True)
-            self.return_hidden = True
-        else:
-            
-            ### goal: (V_cls @ V_proj) @ (T_emb @ T_proj)
-            
-            self.classifier = nn.Parameter(text_features)
-            self.return_hidden = False
-            
-            
-        ### Freezing practice here
+        self.text_features_per = nn.Parameter(text_features.clone())
+        self.template_logits_w  = nn.Parameter(torch.zeros(N, per)) # (N, per)
         
+        self.per = per
+        self.return_hidden = self.HvProjection
+
+        
+        
+    ### Freezing practice here
+    @torch.no_grad()
     def encode_image_hidden(self, pixel_values):
         """
         Return ViT hidden [CLS] before projection (B, 768)
@@ -118,15 +72,30 @@ class CLIPViT(nn.Module):
         return pooled
 
     def forward(self, pixel_values):
+        
+        eps = 1e-12
+        per = self.per
+        N   = len(self.class_names)
+        s   = torch.exp(self.logit_scale)
+        
+        tf_per = F.normalize(self.text_features_per, dim=-1)
+        
         if self.return_hidden:
             img = self.encode_image_hidden(pixel_values)            # (B, 768)
-            txt = self.classifier / self.classifier.norm(dim=-1, keepdim=True)
-            logits = torch.exp(self.logit_scale) * img @ txt.t()        # (B, ncls)
+            
+            VprojT = self.clip.visual_projection.weight.t() 
+            Wv_per = torch.einsum("md,npd->npm", VprojT, tf_per)
+            Wv_per = F.normalize(Wv_per, dim=-1)
+            logits_per = torch.einsum("bd,npd->bpn", img, Wv_per)
 
-        elif (self.return_hidden == False):
+        else:
             img = self.clip.get_image_features(pixel_values)        # (B, 512)
-            txt = self.classifier / self.classifier.norm(dim=-1, keepdim=True)
-            logits = torch.exp(self.logit_scale) * img @ txt.t()        # (B, ncls)
-
+            img = img / (img.norm(dim=-1, keepdim=True) + eps)
+            
+            logits_per = torch.einsum("bd,npd->bpn", img, tf_per)
+            
+        w = torch.softmax(self.template_logits_w, dim=1)           # (N, per)
+        w = w.transpose(0, 1).unsqueeze(0)    
         
-        return logits    
+        logits = s * (logits_per * w).sum(dim=1)
+        return logits
