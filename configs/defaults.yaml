@@ -3,7 +3,7 @@
 version_base: 1
 
 # === Training loop settings ===
-epochs:     5
+epochs:     3
 save_every: 2
 train:
   print_freq: 10  # log every 10 iters
@@ -17,8 +17,8 @@ master:
 
 # === Experiment metadata ===
 project: HAR-ver2
-exp_group: finalRuns
-exp_name:   linear-classifier-HVprojection-6-prompt
+exp_group:  Aug122025
+exp_name:   baseline
 exp_desc:   
 save_code: True
 
@@ -28,15 +28,15 @@ defaults:
   - scheduler: CosineAnnealingWarmRestarts
   - model: CLIP-ViT-B
   - _self_
-joint_embed: True
+joint_embed: False
 num_classes:  15
 
 # === Loss & Optimizer ===
 loss:
   name: Sign
 optim:
-  base_lr:      1.5e-05
-  weight_decay: 1.0e-04
+  base_lr:      1.6473849365087354e-05
+  weight_decay: 0.00015529
 use_ema: True
 
 # === Data settings ===

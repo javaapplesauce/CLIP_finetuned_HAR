@@ -27,13 +27,13 @@ from omegaconf import DictConfig, OmegaConf
 from rich import pretty
 import wandb
 
-from src.load_data import load_data
+from load_data import load_data
 from sklearn.metrics import (
     precision_score, recall_score, f1_score, average_precision_score
 )
 import numpy as np
 
-from src.textPrompt_embeddings import CLIPViT
+from textPrompt_embeddings import CLIPViT
 
 
 
