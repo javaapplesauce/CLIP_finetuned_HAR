@@ -1,22 +1,20 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Python Debugger: Module",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "torch.distributed.run"
-        },
-        {
-            "name": "Python Debugger: Current File with Arguments",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal",
-            "args": "${command:pickArgs}"
-        }
-    ],
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "DDP: all ranks",
+      "type": "debugpy",
+      "program": "/home/richard/miniconda3/envs/myenv/bin/torchrun",
+      "request": "launch",
+      "justMyCode": false,
+      "args": [
+        "--standalone",
+        "--nnodes=1",
+        "--nproc_per_node=3",
+        "train_distributed.py"
+      ],
+      "console": "integratedTerminal",
+      "subProcess": true,         // auto-attach to worker processes
+    }
+  ]
 }

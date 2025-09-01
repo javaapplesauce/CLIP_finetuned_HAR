@@ -37,21 +37,34 @@ from src.textPrompt_embeddings import CLIPViT
 
 
 
-### initialize wandb
 def wandb_init(cfg: DictConfig):
     wandb.init(
-        project='HAR-ver2',
+        project=cfg.project,
         group=cfg.exp_group,
         name=cfg.exp_name,
         notes=cfg.exp_desc,
-        save_code=True,
+        save_code=cfg.save_code,
         config=OmegaConf.to_container(cfg, resolve=False),
         reinit=True
     )
     OmegaConf.save(config=cfg, f=os.path.join(wandb.run.dir, 'conf.yaml'))
 
+class CLIPImageClassifier(nn.Module):
+    def __init__(self, cfg, num_labels: int):
+        super().__init__()
+        self.clip = CLIPModel.from_pretrained(cfg.model.backbone)
+        dim = self.clip.config.projection_dim  # usually 512
+        self.head = nn.Linear(dim, num_labels)
 
-### build the model (default ViT-32)
+    def forward(self, pixel_values):
+        with torch.set_grad_enabled(self.training):
+            feats = self.clip.get_image_features(pixel_values=pixel_values)  # (B, dim)
+        # optional: L2-normalize like CLIPViT if you want cosine-style logits
+        # feats = feats / feats.norm(dim=-1, keepdim=True)
+        # w = self.head.weight / self.head.weight.norm(dim=-1, keepdim=True)
+        # return feats @ w.t() + self.head.bias
+        return self.head(feats)  # (B, num_labels), raw logits
+
 def build_model(cfg: DictConfig):
     
     if cfg.joint_embed == True:
@@ -64,13 +77,8 @@ def build_model(cfg: DictConfig):
         return CLIPViT(cfg, class_names)
     
     elif cfg.joint_embed == False:
-        return CLIPModel.from_pretrained(
-            cfg.model.backbone,
-            num_labels=15)
+        return CLIPImageClassifier(cfg, num_labels=15)
 
-
-
-### build the criterion
 class SignLoss(nn.Module):
     def forward(self, class_logits, targets):
         assert class_logits.size() == targets.size(), "dimension mismatch"
@@ -94,7 +102,6 @@ def build_criterion(cfg, train_loader):
     else:
         raise ValueError(f"Unknown loss: {cfg.loss.name}")
 
-### build the optimizer
 def build_optimizer(cfg, model):
     optimizer = torch.optim.AdamW(
         model.parameters(), 
@@ -102,7 +109,6 @@ def build_optimizer(cfg, model):
         weight_decay=cfg.optim.weight_decay)
     return optimizer
 
-### build the scheduler
 def build_scheduler(cfg, optimizer):
     if cfg.scheduler.name == 'CosineAnnealingWarmRestarts':
             return lr_scheduler.CosineAnnealingWarmRestarts(
@@ -114,9 +120,6 @@ def build_scheduler(cfg, optimizer):
     else:
         raise NotImplemented(f"Scheduler {cfg.scheduler.name} not implemented")
 
-### data loading --> load_data.py
-
-### validation
 def gather_list(data_list):
     """
     Helper to gather a Python list from all processes.
@@ -134,6 +137,20 @@ def gather_list(data_list):
     else:
         return data_list
 
+
+class Metric:
+    def __init__(self):
+        self.cnt = 0
+        self.val = 0
+        self.total_val = 0
+        self.mean = 0
+
+    def add_val(self, val):
+        self.cnt += 1
+        self.total_val += val
+        self.val = val
+        self.mean = self.total_val / self.cnt
+
 def _evaluate(cfg, model, loader, device):
     """
     Evaluates the model on validation set. Returns dict of metrics.
@@ -143,25 +160,19 @@ def _evaluate(cfg, model, loader, device):
     model.eval()
     all_preds, all_labels, all_probs = [], [], []
 
-
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
-            
-
-            # unwrap DDP
             real_model = model.module if isinstance(model, DDP) else model
-
 
             logits = real_model(pixel_values=images)
             probs   = torch.softmax(logits, dim=1)
-
             preds = torch.argmax(probs, dim=1)
             
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
             all_probs.extend(probs.cpu().tolist())
-    
+            
     if dist.is_initialized():
         all_preds = gather_list(all_preds)
         all_labels = gather_list(all_labels)
@@ -191,23 +202,8 @@ def _evaluate(cfg, model, loader, device):
     mAP = np.mean(APs) * 100
     return {"acc": acc, "prec": prec, "rec": rec, "f1": f1, "mAP": mAP}
 
-### metrics
-class Metric:
-    def __init__(self):
-        self.cnt = 0
-        self.val = 0
-        self.total_val = 0
-        self.mean = 0
 
-    def add_val(self, val):
-        self.cnt += 1
-        self.total_val += val
-        self.val = val
-        self.mean = self.total_val / self.cnt
-
-### training loop
 class Trainer:
-
     def __init__(self, cfg, local_rank) -> None:
         self.cfg = cfg
         self.local_rank = local_rank
@@ -243,7 +239,6 @@ class Trainer:
         if self.global_master:
             wandb_init(self.cfg)
 
-        
         ema = torch.optim.swa_utils.AveragedModel(self.model) if self.cfg.get("use_ema", False) else None
 
         for epoch in range(self.cfg.epochs):
@@ -271,7 +266,8 @@ class Trainer:
                 loss = loss_values.mean()
                 loss.backward()            
                 self.optimizer.step()
-
+                
+                # EMA only
                 if ema:
                     ema.update_parameters(self.model)
 
@@ -281,7 +277,6 @@ class Trainer:
                     self.scheduler.step()  
               
                 metric.add_val(loss.item())
-
                 batch_time = time.time() - start_time
 
                 if self.global_master and it % self.cfg.train.print_freq == 0:
@@ -299,7 +294,6 @@ class Trainer:
                         "train/epoch": epoch,
                     }, step=epoch * len(self.train_loader) + it)
             
-            
             metrics = _evaluate(self.cfg, self.model, self.val_loader, self.device)
             if self.global_master and metrics:
                 print(
@@ -309,7 +303,6 @@ class Trainer:
                     f"F1: {metrics['f1']:.2f}% | "
                     f"mAP: {metrics['mAP']:.2f}%"
                 )
-                
                 wandb.log({
                     "val/acc": metrics["acc"],
                     "val/prec": metrics["prec"],
@@ -320,7 +313,6 @@ class Trainer:
                 
                 if epoch % self.save_every == 0:
                     self._save_checkpoint(epoch)
-                    
                 if metrics['mAP'] > self.best_acc:
                     self.best_acc = metrics['mAP']
                     self._save_checkpoint(epoch, best=True)
@@ -341,11 +333,7 @@ class Trainer:
                 "test/mAP": metrics["mAP"],
             })
 
-        
-
-
     def _save_checkpoint(self, epoch, best: bool = False):
-        
         ckp = {
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
@@ -353,11 +341,8 @@ class Trainer:
             "epoch": epoch,
             "best_acc": self.best_acc,
         }
-        
         path = "best.pt" if best else f"checkpoint_epoch{epoch}.pt"
         torch.save(ckp, path)
-
-
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="defaults")
@@ -365,27 +350,22 @@ def main(cfg: DictConfig):
     pretty.install()
     # OmegaConf.resolve(cfg)
 
-
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    # 1) initialize DDP from torchrun's env vars
     dist.init_process_group(
         backend="nccl",
         init_method="env://",
         timeout=timedelta(minutes=10),
     )
-
-    # 2) discover ranks
     world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     
     trainer = Trainer(cfg, local_rank)
-    trainer.train()
-    dist.destroy_process_group()
-
-
-
+    try:
+        trainer.train()
+    finally:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
