@@ -28,7 +28,7 @@ defaults:
   - scheduler: CosineAnnealingWarmRestarts
   - model: CLIP-ViT-B
   - _self_
-joint_embed: False
+init_classifier: True
 num_classes:  15
 
 # === Loss & Optimizer ===
